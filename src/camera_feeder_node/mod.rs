@@ -18,6 +18,7 @@ use ros_env::std_msgs::msg::Header;
 
 use bus::BusWatch;
 use parameters::Parameters;
+use stamp::FrameTiming;
 
 /// The sole opener of the camera: one capture pipeline whose MJPEG stream is teed to the WebRTC
 /// worker as RTP/JPEG and to ROS as `sensor_msgs/CompressedImage` on the relative topic
@@ -35,7 +36,7 @@ pub struct CameraFeederNode {
     _bus_watch: BusWatch,
     pipeline: gst::Pipeline,
     _parameters: Parameters,
-    _node: Node,
+    node: Node,
 }
 
 impl CameraFeederNode {
@@ -62,7 +63,6 @@ impl CameraFeederNode {
             publisher,
             node.get_clock(),
             node.logger().clone(),
-            pipeline.clone(),
             config.frame_id,
         ));
 
@@ -71,7 +71,12 @@ impl CameraFeederNode {
 
         if let Err(err) = pipeline.set_state(gst::State::Playing) {
             // Back to NULL so the device is released before the process exits for respawn.
-            let _ = pipeline.set_state(gst::State::Null);
+            if let Err(null_err) = pipeline.set_state(gst::State::Null) {
+                log_error!(
+                    node.logger(),
+                    "[CameraFeederNode] pipeline did not reach NULL after a failed start: {null_err}"
+                );
+            }
             return Err(format!("[CameraFeederNode] pipeline failed to start: {err}").into());
         }
 
@@ -90,7 +95,7 @@ impl CameraFeederNode {
             _bus_watch: bus_watch,
             pipeline,
             _parameters: parameters,
-            _node: node,
+            node,
         })
     }
 }
@@ -99,7 +104,12 @@ impl Drop for CameraFeederNode {
     fn drop(&mut self) {
         // Runs only on an orderly shutdown — rclrs installs no SIGINT handler, so Ctrl-C and
         // SIGTERM end the process without it, and the kernel closes the device instead.
-        let _ = self.pipeline.set_state(gst::State::Null);
+        if let Err(err) = self.pipeline.set_state(gst::State::Null) {
+            log_error!(
+                self.node.logger(),
+                "[CameraFeederNode] pipeline did not reach NULL on shutdown: {err}"
+            );
+        }
     }
 }
 
@@ -109,11 +119,15 @@ impl Drop for CameraFeederNode {
 /// The JPEG bytes are copied once, into the message; nothing is decoded. A publish error is logged
 /// (throttled) and the frame dropped — returning an error to GStreamer would stop the whole
 /// pipeline, the RTP branch with it.
+///
+/// The pipeline clock and base time are read off the appsink itself, which the pipeline hands both
+/// to when it goes PLAYING. The closure must not capture the pipeline: the pipeline owns the
+/// appsink and the appsink owns this closure, so a captured pipeline would be a reference cycle
+/// that is never freed.
 fn frame_publisher(
     publisher: Publisher<CompressedImage>,
     clock: Clock,
     logger: Logger,
-    pipeline: gst::Pipeline,
     frame_id: String,
 ) -> gst_app::AppSinkCallbacks {
     gst_app::AppSinkCallbacks::builder()
@@ -127,13 +141,12 @@ fn frame_publisher(
             // Read both clocks back to back, so the age measured on the pipeline clock and the
             // node time it is subtracted from describe the same instant.
             let ros_now = clock.now().nsec;
-            let pipeline_now = pipeline.clock().map(|c| c.time().nseconds());
-            let stamp_ns = stamp::capture_stamp_ns(
-                ros_now,
-                pipeline_now,
-                pipeline.base_time().map(gst::ClockTime::nseconds),
-                buffer.pts().map(gst::ClockTime::nseconds),
-            );
+            let timing = FrameTiming {
+                clock_now: sink.clock().map(|c| c.time().nseconds()),
+                base_time: sink.base_time().map(gst::ClockTime::nseconds),
+                pts: buffer.pts().map(gst::ClockTime::nseconds),
+            };
+            let stamp_ns = stamp::capture_stamp_ns(ros_now, timing);
             let (sec, nanosec) = stamp::to_sec_nanosec(stamp_ns);
 
             let message = CompressedImage {

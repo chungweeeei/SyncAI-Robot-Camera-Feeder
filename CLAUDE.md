@@ -78,6 +78,15 @@ New logic that can be expressed over plain Rust types goes in a pure module with
 **Threading:** no rclrs worker or timer. Frames are published from the appsink's GStreamer
 streaming thread (an rclrs `Publisher` is an `Arc`, `publish(&self)`), the bus is polled on its
 own thread, and the executor only spins so the node is in the graph and serves its parameters.
+The appsink callback must not capture the `gst::Pipeline`: the pipeline owns the appsink, the
+appsink owns the callback, and a captured pipeline is a reference cycle that is never freed. Read
+the clock and base time off the `sink` argument instead (the pipeline distributes both to every
+element).
+
+**ISP modes are enums** (`Exposure`, `WhiteBalance`, `PowerLineFrequency` in `pipeline.rs`), not the
+raw V4L2 numbers, because the two auto switches have opposite polarity. Raw numbers exist only
+where the params file is parsed (`parameters.rs`, where an unknown value falls back with a warning)
+and where the `extra-controls` string is rendered.
 
 **Failure handling is "exit and respawn", deliberately.** Any bus ERROR or EOS (device held by
 another process, `not-negotiated`, camera unplugged) ends the process with code 1, and the launch

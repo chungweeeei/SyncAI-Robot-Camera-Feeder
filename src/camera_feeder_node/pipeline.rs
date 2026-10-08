@@ -7,6 +7,47 @@
 /// The appsink feeding `image_raw/compressed`; the node looks it up by this name.
 pub const ROS_SINK_NAME: &str = "ros";
 
+/// Default manual exposure, in 100 µs units (33 ms). Only applies to [`Exposure::Manual`].
+pub const DEFAULT_EXPOSURE_TIME_100US: u32 = 330;
+/// Default manual white balance, in Kelvin. See [`SensorControls::default`] for where it comes
+/// from.
+pub const DEFAULT_WHITE_BALANCE_KELVIN: u32 = 5200;
+
+/// Exposure mode. The manual time exists only in manual mode, so a "manual value written while the
+/// mode is still automatic" — which the driver rejects — cannot be expressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exposure {
+    Auto,
+    Manual { time_100us: u32 },
+}
+
+/// White-balance mode; the temperature exists only in manual mode, as with [`Exposure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhiteBalance {
+    Auto,
+    Manual { kelvin: u32 },
+}
+
+/// Mains flicker correction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerLineFrequency {
+    Disabled,
+    Hz50,
+    Hz60,
+}
+
+impl PowerLineFrequency {
+    /// The V4L2 `power_line_frequency` menu index.
+    #[must_use]
+    pub fn v4l2_value(self) -> u8 {
+        match self {
+            Self::Disabled => 0,
+            Self::Hz50 => 1,
+            Self::Hz60 => 2,
+        }
+    }
+}
+
 /// Sensor controls written through `v4l2src extra-controls` when capture starts.
 ///
 /// Ported from the WebRTC worker (`internal/config/config.go`, `internal/proc/video.go`), whose
@@ -15,42 +56,38 @@ pub const ROS_SINK_NAME: &str = "ros";
 /// last one left behind — on this fleet that was manual exposure at 4 ms and white balance frozen
 /// at 4000 K, an image both very dark and very blue.
 ///
-/// Polarity trap, and the two controls disagree: `auto_exposure` is a menu with UVC numbering
-/// (0 = auto, 1 = manual), while `white_balance_automatic` is a plain boolean (1 = automatic).
+/// The modes are enums rather than the raw V4L2 numbers because the raw numbers are a trap: the
+/// two switches disagree on polarity (`auto_exposure` is a UVC menu where 0 = auto, while
+/// `white_balance_automatic` is a boolean where 1 = auto). The numbers appear only in
+/// [`sensor_controls`], where the string is rendered, and in `parameters.rs`, where the params file
+/// is parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SensorControls {
-    /// 0 = auto, 1 = manual.
-    pub auto_exposure: i64,
-    /// In 100 µs units; only written when `auto_exposure` is 1.
-    pub exposure_time: i64,
-    /// 1 = automatic, 0 = manual.
-    pub white_balance_automatic: i64,
-    /// Kelvin; only written when `white_balance_automatic` is 0.
-    pub white_balance_temperature: i64,
+    pub exposure: Exposure,
+    pub white_balance: WhiteBalance,
     pub gain: i64,
     pub brightness: i64,
-    /// 0 = disabled, 1 = 50 Hz, 2 = 60 Hz.
-    pub power_line_frequency: i64,
+    pub power_line_frequency: PowerLineFrequency,
 }
 
 impl Default for SensorControls {
     fn default() -> Self {
         Self {
-            auto_exposure: 0,
-            exposure_time: 330,
+            exposure: Exposure::Auto,
             // Manual at 5200 K, measured on the robot rather than guessed: the camera's AWB
             // settles distinctly blue under the lab's fluorescent lighting, and 5200 K sits
             // between the neutral points measured against a white wall (5040 K) and a grey carpet
             // (5410 K). Fixed also because AWB retunes as the frame fills with a coloured wall,
             // shifting the colour while nothing in the scene changed. See the worker's config.go
             // for the full sweep.
-            white_balance_automatic: 0,
-            white_balance_temperature: 5200,
+            white_balance: WhiteBalance::Manual {
+                kelvin: DEFAULT_WHITE_BALANCE_KELVIN,
+            },
             gain: 1,
             brightness: 16,
-            // 50 Hz: the camera ships with flicker correction disabled, and mains lighting then
-            // bands the image.
-            power_line_frequency: 1,
+            // The camera ships with flicker correction disabled, and mains lighting then bands
+            // the image.
+            power_line_frequency: PowerLineFrequency::Hz50,
         }
     }
 }
@@ -78,29 +115,28 @@ pub struct PipelineConfig {
 /// Renders `v4l2src`'s `extra-controls` string.
 ///
 /// Order is load-bearing: each auto switch has to precede the manual value it gates, or the driver
-/// rejects the manual write because the mode is still automatic. A gated value is emitted only
-/// when its automatic mode is off — the driver rejects it otherwise.
+/// rejects the manual write because the mode is still automatic. That is why each mode and its
+/// value are rendered together, switch first.
 #[must_use]
 pub fn sensor_controls(controls: &SensorControls) -> String {
-    let mut out = format!("c,auto_exposure={}", controls.auto_exposure);
-    if controls.auto_exposure == 1 {
-        out += &format!(",exposure_time_absolute={}", controls.exposure_time);
-    }
-    out += &format!(
-        ",white_balance_automatic={}",
-        controls.white_balance_automatic
-    );
-    if controls.white_balance_automatic == 0 {
-        out += &format!(
-            ",white_balance_temperature={}",
-            controls.white_balance_temperature
-        );
-    }
-    out += &format!(
-        ",gain={},brightness={},power_line_frequency={}",
-        controls.gain, controls.brightness, controls.power_line_frequency
-    );
-    out
+    let exposure = match controls.exposure {
+        Exposure::Auto => "auto_exposure=0".to_string(),
+        Exposure::Manual { time_100us } => {
+            format!("auto_exposure=1,exposure_time_absolute={time_100us}")
+        }
+    };
+    let white_balance = match controls.white_balance {
+        WhiteBalance::Auto => "white_balance_automatic=1".to_string(),
+        WhiteBalance::Manual { kelvin } => {
+            format!("white_balance_automatic=0,white_balance_temperature={kelvin}")
+        }
+    };
+    format!(
+        "c,{exposure},{white_balance},gain={},brightness={},power_line_frequency={}",
+        controls.gain,
+        controls.brightness,
+        controls.power_line_frequency.v4l2_value(),
+    )
 }
 
 /// A queue that drops the oldest buffer instead of blocking upstream.
@@ -196,8 +232,7 @@ mod tests {
     #[test]
     fn manual_exposure_follows_its_switch() {
         let controls = SensorControls {
-            auto_exposure: 1,
-            exposure_time: 100,
+            exposure: Exposure::Manual { time_100us: 100 },
             ..SensorControls::default()
         };
         let out = sensor_controls(&controls);
@@ -209,7 +244,7 @@ mod tests {
     #[test]
     fn automatic_white_balance_omits_the_temperature() {
         let controls = SensorControls {
-            white_balance_automatic: 1,
+            white_balance: WhiteBalance::Auto,
             ..SensorControls::default()
         };
         let out = sensor_controls(&controls);
@@ -221,6 +256,24 @@ mod tests {
     fn auto_exposure_omits_the_exposure_time() {
         let out = sensor_controls(&SensorControls::default());
         assert!(!out.contains("exposure_time_absolute"), "{out}");
+    }
+
+    #[test]
+    fn power_line_frequency_uses_the_v4l2_menu_index() {
+        for (mode, index) in [
+            (PowerLineFrequency::Disabled, "0"),
+            (PowerLineFrequency::Hz50, "1"),
+            (PowerLineFrequency::Hz60, "2"),
+        ] {
+            let out = sensor_controls(&SensorControls {
+                power_line_frequency: mode,
+                ..SensorControls::default()
+            });
+            assert!(
+                out.ends_with(&format!("power_line_frequency={index}")),
+                "{out}"
+            );
+        }
     }
 
     #[test]

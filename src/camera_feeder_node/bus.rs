@@ -26,6 +26,7 @@ const WARNING_THROTTLE: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct BusWatch {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    logger: Logger,
 }
 
 impl BusWatch {
@@ -34,10 +35,14 @@ impl BusWatch {
         let stop_flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("gst-bus".to_string())
-            .spawn(move || watch(&pipeline, &logger, &stop_flag))?;
+            .spawn({
+                let logger = logger.clone();
+                move || watch(&pipeline, &logger, &stop_flag)
+            })?;
         Ok(Self {
             stop,
             thread: Some(thread),
+            logger,
         })
     }
 }
@@ -46,7 +51,12 @@ impl Drop for BusWatch {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                log_error!(
+                    &self.logger,
+                    "[BusWatch] the watcher thread panicked; errors after that went unreported"
+                );
+            }
         }
     }
 }
@@ -108,7 +118,9 @@ fn watch(pipeline: &gst::Pipeline, logger: &Logger, stop: &AtomicBool) {
 fn exit(pipeline: &gst::Pipeline, logger: &Logger) -> ! {
     // NULL first: it is what closes the V4L2 fd. The process exit would close it too, but this way
     // the camera is free before the respawned node tries to open it.
-    let _ = pipeline.set_state(gst::State::Null);
+    if let Err(err) = pipeline.set_state(gst::State::Null) {
+        log_error!(logger, "[BusWatch] pipeline did not reach NULL: {err}");
+    }
     log_error!(
         logger,
         "[BusWatch] exiting so the launch file can respawn the node"

@@ -1,7 +1,10 @@
 use rclrs::*;
 use std::sync::Arc;
 
-use super::pipeline::{PipelineConfig, SensorControls};
+use super::pipeline::{
+    DEFAULT_EXPOSURE_TIME_100US, DEFAULT_WHITE_BALANCE_KELVIN, Exposure, PipelineConfig,
+    PowerLineFrequency, SensorControls, WhiteBalance,
+};
 
 const DEFAULT_DEVICE: &str = "/dev/syncai/camera0";
 const DEFAULT_WIDTH: u32 = 1280;
@@ -49,8 +52,6 @@ impl Parameters {
                 .description(description)
                 .read_only()
         };
-        let isp = SensorControls::default();
-
         let device = text(
             "device",
             DEFAULT_DEVICE,
@@ -86,29 +87,30 @@ impl Parameters {
         )?;
         let auto_exposure = integer(
             "auto_exposure",
-            isp.auto_exposure,
+            0,
             "0 = auto, 1 = manual (UVC menu numbering)",
         )?;
         let exposure_time = integer(
             "exposure_time",
-            isp.exposure_time,
+            DEFAULT_EXPOSURE_TIME_100US.into(),
             "exposure in 100 us units; only applied when auto_exposure is 1",
         )?;
-        let white_balance_automatic = integer(
-            "white_balance_automatic",
-            isp.white_balance_automatic,
-            "1 = automatic, 0 = manual",
-        )?;
+        let white_balance_automatic =
+            integer("white_balance_automatic", 0, "1 = automatic, 0 = manual")?;
         let white_balance_temperature = integer(
             "white_balance_temperature",
-            isp.white_balance_temperature,
+            DEFAULT_WHITE_BALANCE_KELVIN.into(),
             "Kelvin; only applied when white_balance_automatic is 0",
         )?;
-        let gain = integer("gain", isp.gain, "sensor gain")?;
-        let brightness = integer("brightness", isp.brightness, "sensor brightness")?;
+        let gain = integer("gain", SensorControls::default().gain, "sensor gain")?;
+        let brightness = integer(
+            "brightness",
+            SensorControls::default().brightness,
+            "sensor brightness",
+        )?;
         let power_line_frequency = integer(
             "power_line_frequency",
-            isp.power_line_frequency,
+            1,
             "flicker correction: 0 off, 1 = 50 Hz, 2 = 60 Hz",
         )?;
 
@@ -126,13 +128,18 @@ impl Parameters {
                 ros_framerate: ros_rate(ros_framerate.get(), framerate_value),
                 source_override: source_override.get().to_string(),
                 sensor_controls: SensorControls {
-                    auto_exposure: auto_exposure.get(),
-                    exposure_time: exposure_time.get(),
-                    white_balance_automatic: white_balance_automatic.get(),
-                    white_balance_temperature: white_balance_temperature.get(),
+                    exposure: exposure(auto_exposure.get(), exposure_time.get(), &mut warn),
+                    white_balance: white_balance(
+                        white_balance_automatic.get(),
+                        white_balance_temperature.get(),
+                        &mut warn,
+                    ),
                     gain: gain.get(),
                     brightness: brightness.get(),
-                    power_line_frequency: power_line_frequency.get(),
+                    power_line_frequency: power_line_frequency_from(
+                        power_line_frequency.get(),
+                        &mut warn,
+                    ),
                 },
             },
             frame_id: frame_id.get().to_string(),
@@ -161,16 +168,80 @@ impl Parameters {
     }
 }
 
-/// A size or rate: zero or negative cannot negotiate, and a value past `u32` is not a size any
-/// sensor offers. Either falls back to the default, with a warning naming the parameter.
+/// A size, rate, exposure time or temperature: zero or negative is meaningless for all of them,
+/// and a value past `u32` is not one any sensor offers. Either falls back to the default, with a
+/// warning naming the parameter.
 fn positive(name: &str, value: i64, default: u32, warn: &mut impl FnMut(String)) -> u32 {
     match u32::try_from(value) {
         Ok(v) if v > 0 => v,
         _ => {
             warn(format!(
-                "{name}={value} is not a positive size/rate; using {default}"
+                "{name}={value} is not a positive value; using {default}"
             ));
             default
+        }
+    }
+}
+
+/// `auto_exposure` (UVC menu: 0 = auto, 1 = manual) plus `exposure_time`, which is read only in
+/// manual mode. Any other mode value falls back to the default mode with a warning rather than
+/// being written to the driver verbatim.
+fn exposure(mode: i64, time_100us: i64, warn: &mut impl FnMut(String)) -> Exposure {
+    match mode {
+        0 => Exposure::Auto,
+        1 => Exposure::Manual {
+            time_100us: positive(
+                "exposure_time",
+                time_100us,
+                DEFAULT_EXPOSURE_TIME_100US,
+                warn,
+            ),
+        },
+        _ => {
+            let fallback = SensorControls::default().exposure;
+            warn(format!(
+                "auto_exposure={mode} is neither 0 (auto) nor 1 (manual); using {fallback:?}"
+            ));
+            fallback
+        }
+    }
+}
+
+/// `white_balance_automatic` (boolean: 1 = auto, 0 = manual — the OPPOSITE polarity of
+/// `auto_exposure`) plus `white_balance_temperature`, read only in manual mode.
+fn white_balance(automatic: i64, kelvin: i64, warn: &mut impl FnMut(String)) -> WhiteBalance {
+    match automatic {
+        1 => WhiteBalance::Auto,
+        0 => WhiteBalance::Manual {
+            kelvin: positive(
+                "white_balance_temperature",
+                kelvin,
+                DEFAULT_WHITE_BALANCE_KELVIN,
+                warn,
+            ),
+        },
+        _ => {
+            let fallback = SensorControls::default().white_balance;
+            warn(format!(
+                "white_balance_automatic={automatic} is neither 1 (auto) nor 0 (manual); \
+                 using {fallback:?}"
+            ));
+            fallback
+        }
+    }
+}
+
+fn power_line_frequency_from(value: i64, warn: &mut impl FnMut(String)) -> PowerLineFrequency {
+    match value {
+        0 => PowerLineFrequency::Disabled,
+        1 => PowerLineFrequency::Hz50,
+        2 => PowerLineFrequency::Hz60,
+        _ => {
+            let fallback = SensorControls::default().power_line_frequency;
+            warn(format!(
+                "power_line_frequency={value} is not 0, 1 or 2; using {fallback:?}"
+            ));
+            fallback
         }
     }
 }
@@ -224,6 +295,62 @@ mod tests {
         assert_eq!(port(0, &mut ignore), DEFAULT_RTP_PORT);
         assert_eq!(port(65_536, &mut ignore), DEFAULT_RTP_PORT);
         assert_eq!(port(-1, &mut ignore), DEFAULT_RTP_PORT);
+    }
+
+    #[test]
+    fn exposure_follows_the_uvc_menu_numbering() {
+        assert_eq!(exposure(0, 999, &mut ignore), Exposure::Auto);
+        assert_eq!(
+            exposure(1, 100, &mut ignore),
+            Exposure::Manual { time_100us: 100 }
+        );
+        assert_eq!(
+            exposure(1, 0, &mut ignore),
+            Exposure::Manual {
+                time_100us: DEFAULT_EXPOSURE_TIME_100US
+            }
+        );
+    }
+
+    #[test]
+    fn white_balance_has_the_opposite_polarity() {
+        assert_eq!(white_balance(1, 999, &mut ignore), WhiteBalance::Auto);
+        assert_eq!(
+            white_balance(0, 4000, &mut ignore),
+            WhiteBalance::Manual { kelvin: 4000 }
+        );
+    }
+
+    #[test]
+    fn unknown_modes_fall_back_to_the_defaults_with_a_warning() {
+        let defaults = SensorControls::default();
+        let mut warnings = Vec::new();
+        let mut warn = |m| warnings.push(m);
+        assert_eq!(exposure(7, 100, &mut warn), defaults.exposure);
+        assert_eq!(white_balance(2, 100, &mut warn), defaults.white_balance);
+        assert_eq!(
+            power_line_frequency_from(3, &mut warn),
+            defaults.power_line_frequency
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    #[test]
+    fn param_file_defaults_parse_to_sensor_controls_default() {
+        // The raw numbers declared as parameter defaults must mean SensorControls::default().
+        let defaults = SensorControls::default();
+        assert_eq!(
+            exposure(0, DEFAULT_EXPOSURE_TIME_100US.into(), &mut ignore),
+            defaults.exposure
+        );
+        assert_eq!(
+            white_balance(0, DEFAULT_WHITE_BALANCE_KELVIN.into(), &mut ignore),
+            defaults.white_balance
+        );
+        assert_eq!(
+            power_line_frequency_from(1, &mut ignore),
+            defaults.power_line_frequency
+        );
     }
 
     #[test]
