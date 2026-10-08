@@ -1,6 +1,6 @@
 # Camera Feeder 設計提案：讓 ROS 與 WebRTC 共用同一顆 camera
 
-狀態：**提案**（2026-10-07）
+狀態：**提案**（2026-10-07；2026-10-08 依 worker `dev` `7b1fa97` 修訂）
 範圍：`SyncAI-Robot-Workspace`、`SyncAI-WebRTC-Worker`、`SyncAI-Robot-Backend`，以及本 repo
 
 ## 1. 問題
@@ -28,9 +28,9 @@ backend 的 `WebRtcGateway` 只在**自己的** `whep` / `whip` / `duplex` sessi
 - AR0234 在 720p 只提供 **60 和 120 fps**，沒有 30；AR0144 是 30 和 60。兩顆都接受的只有 60。
 - UVC 的 ISP 狀態（曝光、白平衡、gain…）**存在 camera firmware 裡，開關 device 不會重置**。誰最後寫，畫面就長誰的樣子。
 
-### 2.2 WebRTC worker（`origin/feat/robot`，`b0f4126`）
+### 2.2 WebRTC worker（`dev`，`7b1fa97`）
 
-> 注意：本機 checkout 的 `feat/robot` 落後 origin 兩個 commit，還是寫死 `/dev/syncai_camera` 的舊版。以下以 origin 為準。
+> `feat/robot` 已經由 PR #6 合進 `dev`。`b0f4126` 之後的 commit 只有改文件，所以 pipeline 跟 config 的程式碼和初版提案讀到的一樣。
 
 - `internal/proc/video.go` 的 `BuildVideoPipelineString`：
   ```
@@ -40,8 +40,12 @@ backend 的 `WebRtcGateway` 只在**自己的** `whep` / `whip` / `duplex` sessi
     ! nvvidconv ! nvv4l2h264enc … ! h264parse ! rtph264pay ! udpsink host=127.0.0.1 port=$VIDEO_RTP_PORT
   ```
 - `internal/config/config.go` 的 `VideoConfig`：`VIDEO_DEVICE`（預設 `/dev/syncai/camera0`）、`VIDEO_FORMAT`（`mjpeg` / `uyvy`）、`VIDEO_WIDTH/HEIGHT/FRAMERATE`（1280x720@60）、`VIDEO_BITRATE`，以及一整組 sensor control（`VIDEO_AUTO_WB=0`、`VIDEO_WB_TEMP=5200`、`VIDEO_POWER_LINE_FREQ=1` 等，附實測理由）。
-- pipeline 是**每個 WHEP session 建一條**，session 結束就釋放 camera；沒有 session 時 camera 是空的。
-- worker 內部本來就用 `127.0.0.1` 上的 RTP（`udpsink` → `udpsrc`）把 GStreamer 接到 pion。
+- worker 有三種 session：`Audio`（WHIP）、`Video`（WHEP），還有新的 **`Duplex`**（camera 送出、mic 收進來，共用一個 peer connection）。**Video 和 Duplex 都會呼叫同一個 `NewVideoGStreamerPipelineWithFactory` → `BuildVideoPipelineString`**，所以 source 只要在這裡改一個地方，兩種 session 都會生效。
+- pipeline 是**每個 WHEP / duplex session 建一條**，session 結束就釋放 camera；沒有 session 時 camera 是空的。
+- worker 內部本來就用 `127.0.0.1` 上的 RTP（`udpsink` → `net.ListenUDP`）把 GStreamer 接到 pion。這些 port 是固定的（Video 和 Duplex 都用 `VIDEO_RTP_PORT` / `VIDEO_AUDIO_RTP_PORT`，Duplex 的 mic 再加上 `AUDIO_RTP_PORT`），所以**就算不受 camera 限制，worker 一次也只能跑一條 camera session**。worker 自己不做仲裁，README / CLAUDE.md 明寫交給 host 處理。
+- 失敗偵測：`startBusWatch` 只輪詢 bus 上的 `ERROR` / `WARNING` / `EOS`，而且**只記 log、不拆 session**。
+- 歷史包袱：worker 以前有一個 **ROS video source mode**（`VideoSourceType` enum ＋ RTP-pusher 的 Unix socket signaling），已經整個移除了。`CLAUDE.md` 現在寫「There is no source-type switch」。§5 的 `rtpjpeg` 分支等於重新加回一個「不是直接開 device」的 source，但形狀不一樣（見 §9 最後一段）。
+- `go-gst` 鎖在 v1.0.0，因為部署環境是 GStreamer **1.20.3**，Tegra plugin 是對它編的。`rtpjpegpay` / `rtpjpegdepay` / `udpsrc` 都在 1.20 的 plugins-good 裡，不受這個 pin 影響。
 
 ### 2.3 ROS camera driver（`SyncAI-Robot-Workspace/src/third-party/vizionsdk-ros2`）
 
@@ -108,7 +112,7 @@ robot container（syncai_bringup window 0）
           t. ! queue leaky=downstream ! [videorate ! image/jpeg,framerate=N/1] ! appsink → image_raw/compressed
 
 backend container
-  WebRTC worker（每個 WHEP session）
+  WebRTC worker（每個 WHEP / duplex session）
     udpsrc port=5008 caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000"
       ! rtpjitterbuffer ! rtpjpegdepay
       ! queue leaky=downstream ! nvjpegdec ! video/x-raw(memory:NVMM)
@@ -165,15 +169,17 @@ backend container
 
 - `internal/config/config.go`：`VIDEO_FORMAT` 新增 `rtpjpeg`；新增 `VIDEO_RTP_IN_PORT`（預設 5008）。
 - `internal/proc/video.go`：`BuildVideoPipelineString` 第三個 source 分支（§5.1），不套 `extra-controls`。
-- `internal/proc/video_test.go`：pipeline 字串的測試。
-- README：source 分支說明；`mjpeg` / `uyvy` 兩個直接開 device 的分支保留，給沒有 feeder 的部署。
+- `internal/proc/video_test.go`：pipeline 字串的測試。Duplex 走同一個 builder，不需要另外補 duplex 的 pipeline 測試。
+- `internal/proc/video.go` `startBusWatch`（建議做）：`udpsrc` 設 `timeout`，bus filter 加上 `MessageElement`，把 `GstUDPSrcTimeout` 記成「N 秒沒收到 feeder 的封包」。不加的話，feeder 沒在跑時就是黑畫面，而且一行 log 都沒有（§8 第 3 點）。
+- README、`CLAUDE.md`：「Video source」那段（目前寫的是「直接開 `VIDEO_DEVICE`、沒有 source-type switch」）、config 表、`VIDEO_FORMAT` 說明都要更新。`mjpeg` / `uyvy` 兩個直接開 device 的分支保留，給沒有 feeder 的部署。另外要說明 `rtpjpeg` 下 sensor control 系列的環境變數（`VIDEO_AUTO_WB` 等）沒有作用。
+- 順手修註解：`video.go` 說 encoder 參數來自 `scripts/publish_camera_crop.sh`，那支 script 會退役（§6.2），註解要改成「參數來源是它，現已移除」；`config.go` 的 `Device` 註解寫「two identical cameras」，跟 §2.1（兩顆不同型號）不一致。
 
 ### 6.4 `SyncAI-Robot-Backend`
 
 - `docker-compose.yml`：環境變數 `VIDEO_FORMAT=rtpjpeg`、`VIDEO_RTP_IN_PORT=5008`；**移除** `/dev/video0..3`、`/dev/syncai` 的 passthrough 和 `VIDEO_GID`（backend 不再碰 camera）。nvidia runtime 保留（`nvjpegdec` / `nvv4l2h264enc` 還在這邊）。
 - `README.md`：WebRTC 段改寫「camera 被別人占用是 502」那段為新架構；部署段的 `--device` 說明對應更新。
 - `CLAUDE.md`：WebRTC 一段補一句 camera 來源。
-- Python 程式**不用改**：`gateways/webrtc` 的 slot 搶佔邏輯不變（camera slot 現在代表「這條 RTP 的 consumer」，語意仍成立）。
+- Python 程式**不用改**：`gateways/webrtc` 在 `whep` / `duplex` 之間的 camera slot 搶佔邏輯維持原樣。改成 feeder 之後，camera 不再是 slot 存在的理由，但 worker 內部的 RTP port 是固定的（§2.2），兩條 camera session 同時跑還是會撞 port，所以 slot 仍然要保留。
 
 ### 6.5 `syncai_sys_manager`
 
@@ -199,6 +205,7 @@ backend container
 1. **另外兩個搶 device 的要先清掉。** host 的 `scripts/publish_camera_crop.sh` 和 `~/controller/.../HTML_joy_controller.py`（OpenCV 開 `/dev/video0`）。owner 模型只有在它們都停掉時才成立；任何一個還在跑，feeder 就會像現在的 `vizionsdk_ros2` 一樣啟動失敗。
 2. **RTP/JPEG（RFC 2435）的格式限制。** 只支援 baseline JPEG、邊長 ≤ 2040（1280x720 沒問題）。UVC 的 MJPEG 通常不帶 Huffman table，`rtpjpegpay` 會略過、`rtpjpegdepay` 補回標準表 —— **要實測 `nvjpegdec` 接受補表後的串流**。若不行，退路是 feeder 用 `jpegparse` 先正規化，或改走 §4 的 C。
 3. **feeder 是單點。** 它一掛，ROS 和 WebRTC 一起沒畫面。緩解：launch `respawn=True`；worker 的 `udpsrc` 分支不會因為沒封包而出錯，feeder 回來就恢復；ROS subscriber 本來就能容忍 topic 中斷。和現在相比不算變差 —— `vizionsdk_ros2` 掛了也不會自己恢復。
+   代價是**錯誤會變安靜**：現在 device 被占用時，bus 上會有 `ERROR`，worker 會記 log；改成 `udpsrc` 之後，feeder 不在就只是沒有封包，bus watch 什麼都看不到。所以 §6.3 建議加上 `udpsrc timeout` 的 log。
 4. **mode switch 期間 WebRTC 會黑掉幾秒。** `switch_mode` 砍掉 byobu session 重建，feeder 跟著重啟。現在 worker 直接開 device 沒有這個現象。接受這個代價，換來 owner 在對的 container 裡。
 5. **UDP 在 `lo` 上的掉包。** 720p@60 的 MJPEG 約 50–100 Mbit/s，每 frame 70 個左右 1400 B 的封包，`lo` 承受得住；`udpsrc` 設 `buffer-size` 保險。backend `CLAUDE.md` 記錄的 UDP 緩衝溢位是 16–45 MB 的單一 PointCloud2，和這裡量級不同。
 6. **gscam2 的打包與 JPEG 直通**（若走 §5.2 的 (1)）。Humble 的 apt 有沒有要查；`image_encoding: jpeg` 要確認沒有先解碼再壓縮，否則 Jetson CPU 跑 720p@60 的軟體 JPEG 會很重。
@@ -214,6 +221,8 @@ backend container
 3. worker 內部本來就用 `127.0.0.1` 的 RTP 接 pipeline，`udpsrc` 分支是它既有模式的延伸，不是新概念。
 
 既然 ROS 端一定要換節點，loopback 剩下的唯一好處（consumer 不用改）就消失了，而它的成本（kernel module、host service、udev rule）全在。
+
+另外，這個設計也跟 worker 已經移除的 ROS video source mode 不同。那個模式要靠 `VideoSourceType` enum 和 RTP-pusher 的 Unix socket signaling 協調；這裡只是 `VIDEO_FORMAT` 多一個值，沒有 signaling，也沒有兩端的生命週期耦合（feeder 只管往固定 port 送，worker 只管收）。worker `CLAUDE.md` 提到的長期方向 —— 拿掉 cgo、改成 supervise `gst-launch-1.0` 子行程 —— 跟這個設計也相容，因為 source 一樣只是 pipeline 字串的一段。
 
 ## 10. 待決事項
 
