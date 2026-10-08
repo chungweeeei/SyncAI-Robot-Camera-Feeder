@@ -1,0 +1,26 @@
+# Parameters for the syncai_camera_feeder node.
+#
+# SCAFFOLD: the node does not declare or read any of these yet. They are the parameters PROPOSAL.md
+# §6.1 lists, written down so the launch file has something to pass; the values are the proposal's
+# and will be revisited as the pipeline is implemented.
+#
+# The key is a bare /** because rclrs only matches a params-file key that is exactly "/**" or
+# exactly the node's fully-qualified name, with NO wildcard expansion (see SyncAI-Robot-State's
+# params file for what /**/<node> silently costs). /** is safe because this file is only ever
+# passed to this one node.
+/**:
+  ros__parameters:
+    # The udev symlink from syncai_sys_manager, not /dev/videoN (whose numbering follows probe
+    # order).
+    device: "/dev/syncai/camera0"
+    # One resolution for the whole system; the AR0234 offers only 60 and 120 fps at 720p.
+    width: 1280
+    height: 720
+    framerate: 60
+    # RTP/JPEG to the WebRTC worker; must match the worker's VIDEO_RTP_IN_PORT.
+    rtp_host: "127.0.0.1"
+    rtp_port: 5008
+    # Rate of image_raw/compressed. Undecided (PROPOSAL.md §10 item 1).
+    ros_framerate: 60
+    # Overridden by the launch file with <robot_id>/camera_optical_frame.
+    frame_id: "camera_optical_frame"
