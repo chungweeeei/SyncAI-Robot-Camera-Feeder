@@ -1,0 +1,107 @@
+// VS Code Dev Container for developing this package on its own. In production the package is
+// vcs-imported into SyncAI-Robot-Workspace, which has its own image; nothing here is used there.
+//
+// The container builds a colcon workspace around the repo: /workspace is a named volume (build/
+// install/ log/), and the repo is bind-mounted at /workspace/src/syncai_camera_feeder, the same
+// path it will have in SyncAI-Robot-Workspace.
+//
+// No interface.repos: the node publishes sensor_msgs/CompressedImage only, which the ros2_rust
+// underlay already builds, so there is no syncai_common to import.
+//
+// There is no camera on a development machine. On the robot (or any Linux host with the camera),
+// add "--device=/dev/syncai/camera0" to runArgs; Docker refuses to start the container if the
+// device is missing, which is why it is not there by default.
+{
+  "name": "SyncAI Camera Feeder (ROS 2 + Rust + GStreamer)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "ROS_DISTRO": "humble",
+      // Always the ros user with uid/gid 1000, regardless of the host user
+      "USER_UID": "1000",
+      "USER_GID": "1000",
+      // Also install Claude Code inside the Dev Container
+      "INSTALL_CLAUDE_CODE": "true"
+    }
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/src/syncai_camera_feeder,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace/src/syncai_camera_feeder",
+  "mounts": [
+    "source=syncai-camera-feeder_workspace,target=/workspace,type=volume",
+    "source=syncai-camera-feeder_cargo-registry,target=/home/ros/.cargo/registry,type=volume",
+    "source=syncai-camera-feeder_cargo-git,target=/home/ros/.cargo/git,type=volume",
+    // Claude Code settings and login, so rebuilding the container does not require logging in again
+    "source=syncai-camera-feeder_claude-config,target=/home/ros/.claude,type=volume"
+  ],
+  "runArgs": [
+    // Fixed name so `docker exec syncai-camera-feeder ...` works from the host
+    "--name=syncai-camera-feeder",
+    // tini as PID 1 so zombie processes left behind after Ctrl-C get reaped
+    "--init",
+    // Host network: DDS goes over the physical NIC / lo, not the docker bridge, and the RTP the
+    // feeder sends to 127.0.0.1 reaches a WebRTC worker running on the same host — the same
+    // arrangement as the robot, where both containers are on the host network.
+    "--network=host"
+  ],
+  "containerEnv": {
+    // 2 matches the other SyncAI dev containers, so they see each other's topics.
+    // Change this to isolate from other ROS graphs on the same machine (the real robot is domain 1).
+    "ROS_DOMAIN_ID": "2",
+    "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp"
+  },
+  // Build once so rust-analyzer finds the generated message crates
+  "postCreateCommand": "cd /workspace && colcon build --symlink-install",
+
+  // Both the container and the VS Code server run as ros (uid/gid 1000), not root
+  "containerUser": "ros",
+  "remoteUser": "ros",
+  // Do not remap the uid to the host user; keep it at 1000
+  "updateRemoteUserUID": false,
+
+  // Use a login shell for the environment so rust-analyzer and friends see the sourced ROS 2 env
+  "userEnvProbe": "loginInteractiveShell",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "redhat.vscode-xml",
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "ranch-hand-robotics.rde-ros-2",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        // Keep target/ in the workspace volume to avoid compiling on a macOS bind mount
+        "rust-analyzer.cargo.targetDir": "/workspace/build/.rust-analyzer",
+        "rust-analyzer.check.command": "clippy",
+
+        // Format on save: Rust goes through rust-analyzer (which reads rustfmt.toml next to Cargo.toml)
+        "files.autoSave": "onFocusChange",
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        },
+        "[toml]": {
+          "editor.defaultFormatter": "tamasfe.even-better-toml",
+          "editor.formatOnSave": true
+        },
+        "[xml]": {
+          "editor.defaultFormatter": "redhat.vscode-xml",
+          "editor.formatOnSave": true
+        },
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true,
+        "files.watcherExclude": {
+          "**/build/**": true,
+          "**/install/**": true,
+          "**/log/**": true,
+          "**/target/**": true
+        }
+      }
+    }
+  }
+}

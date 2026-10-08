@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>syncai_camera_feeder</name>
+  <version>0.1.0</version>
+  <description>Sole owner of /dev/syncai/camera0: fans its MJPEG stream out as localhost RTP/JPEG to the WebRTC worker and as sensor_msgs/CompressedImage to ROS</description>
+  <maintainer email="andy_tseng@syncrobotic.com">andy_tseng</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclrs</depend>
+  <depend>rosidl_runtime_rs</depend>
+  <!-- Message packages are declared here, NOT in Cargo.toml: colcon-ros-cargo puts them on
+       AMENT_PREFIX_PATH and wires them into the `ros_env` crate at build time, and without a
+       <depend> here `ros_env::<pkg>` simply does not exist. -->
+  <depend>builtin_interfaces</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <!-- GStreamer is linked through the `gstreamer` / `gstreamer-app` crates, whose build scripts
+       find it with pkg-config, so the -dev packages are build dependencies and the plugins the
+       pipeline instantiates by name are run dependencies. -->
+  <build_depend>libgstreamer1.0-dev</build_depend>
+  <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
+  <exec_depend>gstreamer1.0-plugins-base</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-good</exec_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>
