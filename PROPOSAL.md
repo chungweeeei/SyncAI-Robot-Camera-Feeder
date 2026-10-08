@@ -1,6 +1,6 @@
 # Camera Feeder 設計提案：讓 ROS 與 WebRTC 共用同一顆 camera
 
-狀態：**提案**（2026-10-07；2026-10-08 依 worker `dev` `7b1fa97` 修訂）
+狀態：**提案**（2026-10-07；2026-10-08 依 worker `dev` `7b1fa97` 修訂，並確認 ROS 端需求：錄 rosbag）
 範圍：`SyncAI-Robot-Workspace`、`SyncAI-WebRTC-Worker`、`SyncAI-Robot-Backend`，以及本 repo
 
 ## 1. 問題
@@ -74,7 +74,7 @@ backend 的 `WebRtcGateway` 只在**自己的** `whep` / `whip` / `duplex` sessi
 
 ## 3. 先決問題：ROS 真的需要 camera0 的影像嗎？
 
-這個問題決定要不要做後面的任何事，目前**沒有答案**。
+**已確認：需要。用途是錄 rosbag**（2026-10-08）。所以落在下表第三列，要做第 5 節的設計。
 
 | 情況 | 該做什麼 |
 |---|---|
@@ -82,7 +82,19 @@ backend 的 `WebRtcGateway` 只在**自己的** `whep` / `whip` / `duplex` sessi
 | ROS 需要影像，但不在乎是哪顆鏡頭 | ROS 用 `camera_device_index:=1`（AR0144，`bringup.yaml` 註明 MJPG 可用），零程式改動 |
 | ROS 需要 **camera0** 的影像，且要和 WebRTC **同時** | 才需要第 5 節的設計 |
 
-> 待決：請在 §10 填上誰要用這個影像、做什麼用、需要多少 fps。
+> 前提假設：錄的是 **camera0**，而且錄影時操作員也開著 WebRTC 畫面（邊遙控邊錄）。如果錄的時候不會同時看 WebRTC，或者錄 camera1 也行，就退回第二列，不用做 feeder。
+>
+> 還沒定的是 **fps**（§10 第 1 點）。
+
+### 3.1 錄 rosbag 帶來的需求
+
+用途是錄 bag 而不是即時看，這會影響後面幾個設計點：
+
+- **錄影的路徑已經有了。** backend 的 `RecordingGateway`（`gateways/recording/recording.py`）在 backend container 裡把 `ros2 bag record` 當子行程跑。topic 由 API 帶進來，相對名稱會展開成 `/<robot_id>/…`，預設只錄 `livox/lidar` 和 `livox/imu`。所以要錄影像，在 request 裡加上 `image_raw/compressed` 就好，**backend 不用改程式**。
+- **stamp 要能跟 lidar / IMU 對齊。** 現在 `vizionsdk_ros2` 用的是 `this->now()`，這是 frame 經過 USB 傳輸、進 ROS 之後的時間，延遲不固定。即時看無所謂，但 bag 回放時影像和點雲會錯開。§5.3 改成用 capture 時間。
+- **CompressedImage（JPEG）一定要錄壓縮過的。** raw `Image` 在 720p 下每張約 2.7 MB（RGB），60 fps 就是 160 MB/s，不可能錄。設計本來就是 JPEG 直通，這點剛好符合。
+- **錄影量和磁碟。** 估計 720p MJPEG 約 6–12 MB/s @60 fps，也就是每小時 22–45 GB；`MAX_BAG_SIZE_BYTES` 是 2 GB，大約 3–5 分鐘切一個檔。降到 30 fps 就減半。實際的 frame 大小要在 robot 上量（§7）。
+- **zstd 對 JPEG 沒有幫助。** `RecordingGateway` 的 `compression` 走的是 file mode zstd，Orin 上大約 40 MB/s，停止錄影時要先壓完最後一個 split 才能結束。JPEG 幾乎壓不下去，加進影像只會讓 stop 變慢（§8 第 9 點）。
 
 ## 4. 方案比較
 
@@ -138,17 +150,18 @@ backend container
 | 程式量 | 幾乎沒有：launch + params，pipeline 字串放 `gscam_config`，`tee` 寫在字串裡 | 約 150 行 |
 | 依賴 | `gscam2` + `ros2_shared`，Humble 的 apt 可能沒有，要進 `third-party.repos` 從原始碼編 | 只有 apt 的 `python3-gst-1.0`、`gstreamer1.0-plugins-good`（已有） |
 | JPEG 直通 | `image_encoding: jpeg` 直接發 `CompressedImage`（**待確認 gscam2 保留了這個模式**） | 自己掌握 |
+| capture stamp（§5.3） | 要確認 gscam2 有沒有用 GStreamer timestamp 的選項（ROS 1 的 gscam 有 `use_gst_timestamps`），以及它怎麼換算成 ROS time | 自己掌握 |
 | 線上調 ISP | 無 | 可做成 ROS 參數 → `v4l2-ctl` |
 | 風險 | 第三方打包、JPEG 模式不如預期 | 程式歸我們維護 |
 
-決定點：(1) 的打包和 JPEG 直通在 robot 上驗證通過就用 (1)；任一不通就直接做 (2)，不要花時間修 gscam2。
+決定點：(1) 的打包、JPEG 直通、**capture stamp** 三項都在 robot 上驗證通過就用 (1)；任一項不通就直接做 (2)，不要花時間修 gscam2。因為要錄 bag，stamp 這項是硬性條件。
 
 ### 5.3 ROS 介面（維持相容）
 
 - topic：`<robot_id>/image_raw/compressed`（`sensor_msgs/CompressedImage`，`format: jpeg`），和現在 `vizionsdk_ros2` 發的一樣。
 - `frame_id`：`<robot_id>/camera_optical_frame`，照 bringup 現在的做法由 launch 帶 `robot_id`。
 - `camera_info`：不發（現在也沒有，intrinsics 讀不到）。
-- stamp：節點收到 frame 的時間。精度和現在的 `this->now()` 相同。
+- stamp：**用 capture 時間，不用節點收到 frame 的時間**（§3.1，錄 bag 要跟 lidar 對齊）。做法是拿 GStreamer buffer 的 PTS 加上 pipeline 的 `base_time`，得到 pipeline clock（monotonic）時間，再用一次性量到的 monotonic → ROS time offset 換算。PTS 要來自 V4L2 buffer 的 kernel timestamp，**這點要實測確認**：要確認 `v4l2src`（加上 `do-timestamp=true`）給的時間是 capture 時間，不是 push 進 pipeline 的時間。目標是同一個 frame 的影像和點雲在 bag 裡的時間差在一個 frame 以內，而且是固定的。
 
 ## 6. 各 repo 的改動
 
@@ -179,6 +192,7 @@ backend container
 - `docker-compose.yml`：環境變數 `VIDEO_FORMAT=rtpjpeg`、`VIDEO_RTP_IN_PORT=5008`；**移除** `/dev/video0..3`、`/dev/syncai` 的 passthrough 和 `VIDEO_GID`（backend 不再碰 camera）。nvidia runtime 保留（`nvjpegdec` / `nvv4l2h264enc` 還在這邊）。
 - `README.md`：WebRTC 段改寫「camera 被別人占用是 502」那段為新架構；部署段的 `--device` 說明對應更新。
 - `CLAUDE.md`：WebRTC 一段補一句 camera 來源。
+- 錄影：`RecordingGateway` **不用改**，request 的 `topics` 加上 `image_raw/compressed` 就會錄到。README 的錄影段落要補兩件事：可以錄影像；錄影像時建議 `compression: false`（§3.1）。要不要把影像加進 `DEFAULT_TOPICS` 等 fps 和磁碟量定了再說，目前不加，因為預設那兩個 topic 是給 LIO 回放用的。
 - Python 程式**不用改**：`gateways/webrtc` 在 `whep` / `duplex` 之間的 camera slot 搶佔邏輯維持原樣。改成 feeder 之後，camera 不再是 slot 存在的理由，但 worker 內部的 RTP port 是固定的（§2.2），兩條 camera session 同時跑還是會撞 port，所以 slot 仍然要保留。
 
 ### 6.5 `syncai_sys_manager`
@@ -187,18 +201,21 @@ backend container
 
 ## 7. 實施順序
 
-1. **回答 §3。** 答案是「不需要」或「不挑鏡頭」就到此為止。
+1. ~~回答 §3。~~ 已確認要錄 bag。剩下 fps（§10 第 1 點）。
 2. **在 robot 上手動驗證**（不改任何 repo）：
    - 停掉 `publish_camera_crop.sh` 和搖桿 UI，`fuser -v /dev/video*` 確認沒人占著。
    - `gst-launch-1.0` 跑 §5.1 的 feeder 字串（`tee` 到 `udpsink` + `fakesink`）。
    - 另一個 shell 跑 worker 那段 `udpsrc … ! rtpjpegdepay ! nvjpegdec ! … ! fakesink`，確認 `nvjpegdec` 吃得下 depay 出來的 JPEG（§8 第 2 點）。
    - 殺掉 feeder 再重啟，確認 `udpsrc` 那條會自己恢復畫面。
    - 若走 gscam2：建起來，確認 `image_encoding: jpeg` 真的發 `CompressedImage` 且 CPU 沒有明顯上升。
+   - 量實際的 JPEG frame 大小（`ros2 topic bw`），用來估磁碟用量（§3.1）。
 3. **worker**：`rtpjpeg` 分支 + 測試。獨立、最確定要做，可以先動。
 4. **本 repo**：feeder package。
 5. **workspace**：repos、Dockerfile、bringup、yaml、退役 script。
 6. **backend**：compose、README、CLAUDE.md。
-7. 整合測試：WHEP 開著的同時 `ros2 topic hz image_raw/compressed`；`switch_mode` 一次，確認 WebRTC 畫面在 bringup 回來後自己恢復。
+7. 整合測試：
+   - WHEP 開著的同時 `ros2 topic hz image_raw/compressed`；`switch_mode` 一次，確認 WebRTC 畫面在 bringup 回來後自己恢復。
+   - WHEP 開著的同時透過 `/api/v1/recordings` 錄 `livox/lidar` + `livox/imu` + `image_raw/compressed`。`ros2 bag info` 的影像訊息數要接近「錄影秒數 × fps」，而且沒有掉幀；回放時影像和點雲對齊（例如拍一個快速通過的物體，檢查 stamp 差）。
 
 ## 8. 風險與驗證清單
 
@@ -210,7 +227,8 @@ backend container
 5. **UDP 在 `lo` 上的掉包。** 720p@60 的 MJPEG 約 50–100 Mbit/s，每 frame 70 個左右 1400 B 的封包，`lo` 承受得住；`udpsrc` 設 `buffer-size` 保險。backend `CLAUDE.md` 記錄的 UDP 緩衝溢位是 16–45 MB 的單一 PointCloud2，和這裡量級不同。
 6. **gscam2 的打包與 JPEG 直通**（若走 §5.2 的 (1)）。Humble 的 apt 有沒有要查；`image_encoding: jpeg` 要確認沒有先解碼再壓縮，否則 Jetson CPU 跑 720p@60 的軟體 JPEG 會很重。
 7. **失去 `vizionsdk_ros2` 的功能**：`ros2 param set …/vizionsdk_camera isp.*` 線上調參、`camera/status` 診斷 topic、vendor 擴充的 eHDR / denoise / flip。今天只用了 `isp.whitebalance_mode` 一項，等於沒有損失；IMU 和 intrinsics 這顆本來就讀不到。若日後換成支援 IMU 的模組，VizionSDK 只讀 IMU、不開串流，理論上能和 feeder 共存，**未驗證**。
-8. **延遲**：多一跳約一個 frame（60 fps 下 ≈ 17 ms）。stamp 精度與現在相同。
+8. **延遲**：多一跳約一個 frame（60 fps 下 ≈ 17 ms）。stamp 改用 capture 時間（§5.3）之後，這一跳不會反映在 stamp 上，所以 bag 裡的對齊反而比現在的 `this->now()` 好。
+9. **錄影的吞吐。** 跨 container 的 CycloneDDS 走 `lo` 上的 UDP，backend `docker-compose.yml` 記錄過預設 208 KB socket buffer 擋下大訊息的事。單張 JPEG（約 100–200 KB）比 buffer 小，但 60 fps 連續送，recorder 一慢 buffer 就會滿。用 §7 整合測試的訊息數檢查；不夠就降 ROS 分支 fps，不要去調 `rmem_max`（backend `CLAUDE.md` 明確反對）。另外，開了 `compression` 的錄影在停止時，要多壓最後一個 split 的 JPEG，又壓不下去，stop 會變慢。
 
 ## 9. 跟原本 `v4l2loopback` 構想的差異
 
@@ -228,7 +246,9 @@ backend container
 
 | # | 問題 | 誰決定 | 影響 |
 |---|---|---|---|
-| 1 | ROS 端誰要用 `image_raw/compressed`？做什麼？需要幾 fps？ | — | 決定要不要做這整件事（§3） |
+| 1 | ~~ROS 端誰要用？做什麼？~~ **錄 rosbag**（已確認）。錄影要幾 fps？60 照錄，還是降到 30 / 15？ | — | 磁碟用量、DDS 吞吐（§3.1、§8 第 9 點） |
+| 1a | 錄 camera0 時，WebRTC 會同時開著嗎？（§3 的前提假設） | — | 不會的話不需要 feeder |
+| 1b | camera1 也要錄嗎？ | — | 要的話，camera1 沒有別人在用，可以直接跑 `vizionsdk_ros2`（`camera_device_index:=1`），不用經過 feeder |
 | 2 | `publish_camera_crop.sh` 和搖桿 UI 還在用嗎？ | — | §8 第 1 點 |
 | 3 | feeder 走 gscam2 還是自寫節點？ | 驗證後定 | §5.2 |
 | 4 | ISP 採用 worker 的實測值（AWB 手動 5200 K）還是自動白平衡？ | — | 建議採 worker 的值，理由在 worker `config.go` 的量測註解 |
