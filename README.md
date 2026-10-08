@@ -14,8 +14,27 @@ camera at the same time:
 The design, the alternatives that were rejected (v4l2loopback, shm, the worker as owner) and the
 changes it needs in the other repos are in [PROPOSAL.md](PROPOSAL.md) (Chinese).
 
-**Status: environment scaffold.** The node starts, initialises GStreamer and logs its version;
-the pipeline is not implemented yet.
+**Status:** implemented and verified in the Dev Container with a `videotestsrc` stand-in (topic at
+60 Hz and at a reduced `ros_framerate`, RTP/JPEG decoded by a separate receiver, exit-and-respawn on
+a pipeline error). Not yet run against the real camera on the robot.
+
+## The node
+
+| Direction | Name | Type / format | Notes |
+|---|---|---|---|
+| Publish | `image_raw/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | SensorData QoS (best effort, keep last 5), as `vizionsdk_ros2` published it |
+| Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | for the WebRTC worker's `rtpjpeg` source |
+
+- **Nothing is decoded.** The camera's JPEG bytes go to both branches untouched, each behind its
+  own leaky queue so neither consumer can stall the capture or the other.
+- **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
+  pipeline clock (`src/camera_feeder_node/stamp.rs`).
+- **ISP controls** (exposure, white balance, gain, flicker) are written once at capture start with
+  the WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
+- **On any pipeline error the node exits** and the launch file respawns it.
+
+Parameters (all read-only) are documented in
+[`params/camera_feeder_params.yaml`](params/camera_feeder_params.yaml).
 
 **This repo is itself a single colcon package** (`package.xml` / `Cargo.toml` live at the root),
 laid out like SyncAI-Robot-State and SyncAI-Robot-Driver-Manager, and is meant to be pulled into

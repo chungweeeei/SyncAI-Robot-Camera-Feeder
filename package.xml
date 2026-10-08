@@ -12,6 +12,7 @@
   <!-- Message packages are declared here, NOT in Cargo.toml: colcon-ros-cargo puts them on
        AMENT_PREFIX_PATH and wires them into the `ros_env` crate at build time, and without a
        <depend> here `ros_env::<pkg>` simply does not exist. -->
+  <depend>builtin_interfaces</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
 

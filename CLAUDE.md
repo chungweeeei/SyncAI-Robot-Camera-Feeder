@@ -7,8 +7,9 @@ worker as RTP/JPEG on `127.0.0.1` and to ROS as `sensor_msgs/CompressedImage`. `
 (Chinese) is the design and the source of truth for why it is shaped this way; read it before
 changing the architecture.
 
-**Status: environment scaffold.** `src/main.rs` only initialises GStreamer, creates the node and
-logs the GStreamer runtime version. The parameters in `params/` are not read yet.
+**Status:** the node is implemented and verified in the Dev Container against a `videotestsrc`
+stand-in. It has not yet run against the real camera on the robot (PROPOSAL.md §7 step 2), and
+the other repos (worker `rtpjpeg` branch, Workspace bringup, Backend compose) are not changed yet.
 
 Its siblings are SyncAI-Robot-State and SyncAI-Robot-Driver-Manager (also Rust/rclrs); this repo
 copies their layout, Dev Container and CI, and their rclrs pitfalls apply here unchanged — see
@@ -45,11 +46,48 @@ docker exec syncai-camera-feeder bash -lc 'cd /workspace/src/syncai_camera_feede
 
 ### No camera in the Dev Container
 
-A development machine has no `/dev/syncai/camera0`. Stand in for the camera with
-`videotestsrc ! video/x-raw,width=1280,height=720,framerate=60/1 ! jpegenc`, which produces the
-same `image/jpeg` caps `v4l2src` does. On the robot, add `--device=/dev/syncai/camera0` to
+A development machine has no `/dev/syncai/camera0`. Stand in for the camera with the
+`source_override` parameter, which replaces the `v4l2src` head of the pipeline:
+
+```bash
+ros2 run syncai_camera_feeder camera_feeder_node --ros-args -r __ns:=/default_robot \
+  -p "source_override:=videotestsrc is-live=true ! video/x-raw,format=YUY2,width=1280,height=720,framerate=60/1 ! jpegenc"
+# then: ros2 topic hz /default_robot/image_raw/compressed
+# and:  gst-launch-1.0 udpsrc port=5008 caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000" ! rtpjitterbuffer ! rtpjpegdepay ! jpegdec ! fakesink
+```
+
+Keep `format=YUY2` (or `I420`). Left to negotiate, `videotestsrc` picks a format whose JPEG chroma
+sampling RTP/JPEG cannot carry, and `rtpjpegpay` rejects every frame with "Invalid component"
+while the ROS branch keeps working — which looks like a broken RTP path rather than a test-source
+problem. On the robot, add `--device=/dev/syncai/camera0` to
 `runArgs` in `devcontainer.json` (it is not there by default because Docker refuses to start a
 container whose device is missing).
+
+## Architecture (`src/camera_feeder_node/`)
+
+| File | Responsibility |
+| --- | --- |
+| `mod.rs` | Wiring: parameters → publisher → pipeline → appsink callbacks → bus watch; `Drop` takes the pipeline to NULL |
+| `parameters.rs` | The load-time (read-only) parameters, validated into `Config`; the validators are unit-tested |
+| `pipeline.rs` | **Pure** pipeline description and `extra-controls` string; unit-tested |
+| `stamp.rs` | **Pure** capture-stamp math (node clock now − frame age on the pipeline clock); unit-tested |
+| `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
+
+New logic that can be expressed over plain Rust types goes in a pure module with unit tests.
+
+**Threading:** no rclrs worker or timer. Frames are published from the appsink's GStreamer
+streaming thread (an rclrs `Publisher` is an `Arc`, `publish(&self)`), the bus is polled on its
+own thread, and the executor only spins so the node is in the graph and serves its parameters.
+
+**Failure handling is "exit and respawn", deliberately.** Any bus ERROR or EOS (device held by
+another process, `not-negotiated`, camera unplugged) ends the process with code 1, and the launch
+file's `respawn=True` restarts it 2 s later. Do not add in-process pipeline rebuilding: a fresh
+process is the one restart that is certain to have released the V4L2 device.
+
+**No hardware acceleration, on purpose.** The pipeline neither decodes nor encodes — JPEG bytes go
+from the camera to both branches untouched — so there is nothing for NVJPG/NVENC to do. Keeping
+Tegra elements out means the robot container needs no nvidia runtime for this node and the Dev
+Container runs the whole pipeline. Transcoding stays in the WebRTC worker.
 
 ## GStreamer version pin
 
