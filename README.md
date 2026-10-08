@@ -15,15 +15,15 @@ The design, the alternatives that were rejected (v4l2loopback, shm, the worker a
 changes it needs in the other repos are in [PROPOSAL.md](PROPOSAL.md) (Chinese).
 
 **Status:** implemented and verified in the Dev Container with a `videotestsrc` stand-in (topic at
-60 Hz and at a reduced `ros_framerate`, RTP/JPEG decoded by a separate receiver, exit-and-respawn on
+30 Hz by default and 60 Hz with `ros_framerate:=0`, RTP/JPEG decoded by a separate receiver, exit-and-respawn on
 a pipeline error). Not yet run against the real camera on the robot.
 
 ## The node
 
 | Direction | Name | Type / format | Notes |
 |---|---|---|---|
-| Publish | `image_raw/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | SensorData QoS (best effort, keep last 5), as `vizionsdk_ros2` published it |
-| Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | for the WebRTC worker's `rtpjpeg` source |
+| Publish | `image_raw/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | 30 Hz (`ros_framerate`); SensorData QoS (best effort, keep last 5), as `vizionsdk_ros2` published it |
+| Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | 60 Hz (`framerate`), for the WebRTC worker's `rtpjpeg` source |
 
 - **Nothing is decoded.** The camera's JPEG bytes go to both branches untouched, each behind its
   own leaky queue so neither consumer can stall the capture or the other.

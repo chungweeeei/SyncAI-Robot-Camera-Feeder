@@ -19,9 +19,9 @@
     # RTP/JPEG to the WebRTC worker; must match the worker's VIDEO_RTP_IN_PORT.
     rtp_host: "127.0.0.1"
     rtp_port: 5008
-    # Rate of image_raw/compressed. 0 publishes every captured frame; a lower positive rate drops
-    # frames on the ROS branch only (videorate drop-only), the RTP branch stays at `framerate`.
-    ros_framerate: 0
+    # Rate of image_raw/compressed. A lower positive rate drops frames on the ROS branch only
+    # (videorate drop-only); the RTP branch stays at `framerate`. 0 publishes every captured frame.
+    ros_framerate: 30
     # Overridden by the launch file with <robot_id>/camera_optical_frame.
     frame_id: "camera_optical_frame"
     # Empty on the robot. On a machine without the camera, a GStreamer fragment producing

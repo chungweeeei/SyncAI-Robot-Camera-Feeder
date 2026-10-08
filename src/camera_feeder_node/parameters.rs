@@ -15,6 +15,10 @@ const DEFAULT_RTP_HOST: &str = "127.0.0.1";
 // The WebRTC worker's VIDEO_RTP_IN_PORT; the two must agree.
 const DEFAULT_RTP_PORT: u16 = 5008;
 const DEFAULT_FRAME_ID: &str = "camera_optical_frame";
+// Half the capture rate: the ROS topic does not need what the operator's live view does, and
+// halving it halves the DDS traffic and whatever records the topic. The RTP branch stays at
+// `framerate`.
+const DEFAULT_ROS_FRAMERATE: u32 = 30;
 
 /// The effective values the node runs on, after validation.
 pub struct Config {
@@ -72,7 +76,7 @@ impl Parameters {
         )?;
         let ros_framerate = integer(
             "ros_framerate",
-            0,
+            DEFAULT_ROS_FRAMERATE.into(),
             "image_raw/compressed rate; 0 or >= framerate publishes every frame",
         )?;
         let frame_id = text(
@@ -258,8 +262,8 @@ fn port(value: i64, warn: &mut impl FnMut(String)) -> u16 {
     }
 }
 
-/// `ros_framerate`: 0 (the default) — and anything that is not a lower positive rate — means the
-/// ROS branch carries every captured frame.
+/// `ros_framerate`: 0 — and anything that is not a lower positive rate — means the ROS branch
+/// carries every captured frame.
 fn ros_rate(value: i64, framerate: u32) -> u32 {
     match u32::try_from(value) {
         Ok(v) if v > 0 && v < framerate => v,
