@@ -1,6 +1,10 @@
 use rclrs::*;
 use std::sync::Arc;
+use std::time::Duration;
 
+use super::eis::{EisConfig, Intrinsics};
+use super::imu::MahonyGains;
+use super::math::Mat3;
 use super::pipeline::{
     DEFAULT_EXPOSURE_TIME_100US, DEFAULT_WHITE_BALANCE_KELVIN, Exposure, PipelineConfig,
     PowerLineFrequency, SensorControls, WhiteBalance,
@@ -20,11 +24,47 @@ const DEFAULT_FRAME_ID: &str = "camera_optical_frame";
 // `framerate`.
 const DEFAULT_ROS_FRAMERATE: u32 = 30;
 
+// Stabilization. The IMU is the lidar's (relative topic, so `<robot_id>/livox/imu`).
+const DEFAULT_IMU_TOPIC: &str = "livox/imu";
+/// Livox reports specific force in g; `sensor_msgs/Imu` is defined in m/s².
+const DEFAULT_ACCEL_SCALE: f64 = 9.806_65;
+/// The TF rotation parent = IMU (REP-103 body: x forward, y left, z up), child = optical frame
+/// (x right, y down, z forward).
+const DEFAULT_IMU_TO_CAMERA_RPY_DEG: [f64; 3] = [-90.0, 0.0, -90.0];
+const DEFAULT_SMOOTHING_TAU_S: f64 = 0.5;
+const DEFAULT_ZOOM: f64 = 1.15;
+const MAX_ZOOM: f64 = 2.0;
+const DEFAULT_MAX_IMU_WAIT_MS: f64 = 5.0;
+const MAX_IMU_WAIT_MS: f64 = 50.0;
+const MAX_IMU_TIME_OFFSET_MS: f64 = 500.0;
+const DEFAULT_MAHONY_KP: f64 = 0.5;
+const MAX_MAHONY_KP: f64 = 10.0;
+
 /// The effective values the node runs on, after validation.
 pub struct Config {
     pub pipeline: PipelineConfig,
     /// The launch file prefixes it with `<robot_id>/`, since TF frame names are not namespaced.
     pub frame_id: String,
+    /// `Some` when `stabilize` is true.
+    pub stabilize: Option<StabilizeConfig>,
+}
+
+/// Everything the stabilized path needs beyond the pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StabilizeConfig {
+    pub imu_topic: String,
+    /// Stamp IMU samples with `header.stamp` (the sensor's own time, which must be in the node
+    /// clock's time base) rather than with the node clock at arrival.
+    pub imu_use_header_stamp: bool,
+    pub eis: EisConfig,
+    /// Added to a frame's capture stamp to find its instant on the IMU's timeline: the configured
+    /// `imu_time_offset_ms` plus half the exposure time (the stamp marks the start of exposure).
+    pub frame_time_offset_ns: i64,
+    /// How long the warp waits for an IMU sample newer than the frame before extrapolating.
+    pub max_imu_wait: Duration,
+    /// Multiplies `linear_acceleration` into m/s².
+    pub accel_scale: f64,
+    pub mahony: MahonyGains,
 }
 
 /// The node's parameters, all of them load-time only.
@@ -39,6 +79,9 @@ pub struct Config {
 pub struct Parameters {
     _text: Vec<ReadOnlyParameter<Arc<str>>>,
     _integer: Vec<ReadOnlyParameter<i64>>,
+    _real: Vec<ReadOnlyParameter<f64>>,
+    _real_array: Vec<ReadOnlyParameter<Arc<[f64]>>>,
+    _flag: Vec<ReadOnlyParameter<bool>>,
 }
 
 impl Parameters {
@@ -51,6 +94,24 @@ impl Parameters {
                 .read_only()
         };
         let integer = |name: &str, default: i64, description: &str| {
+            node.declare_parameter(name)
+                .default(default)
+                .description(description)
+                .read_only()
+        };
+        let real = |name: &str, default: f64, description: &str| {
+            node.declare_parameter(name)
+                .default(default)
+                .description(description)
+                .read_only()
+        };
+        let real_array = |name: &str, default: &[f64], description: &str| {
+            node.declare_parameter(name)
+                .default(Arc::<[f64]>::from(default))
+                .description(description)
+                .read_only()
+        };
+        let flag = |name: &str, default: bool, description: &str| {
             node.declare_parameter(name)
                 .default(default)
                 .description(description)
@@ -118,21 +179,150 @@ impl Parameters {
             "flicker correction: 0 off, 1 = 50 Hz, 2 = 60 Hz",
         )?;
 
+        let stabilize = flag(
+            "stabilize",
+            false,
+            "warp each frame by the IMU orientation (decodes and re-encodes on the CPU)",
+        )?;
+        let imu_topic = text("imu_topic", DEFAULT_IMU_TOPIC, "sensor_msgs/Imu source")?;
+        let imu_use_header_stamp = flag(
+            "imu_use_header_stamp",
+            true,
+            "stamp IMU samples with header.stamp (true) or with the node clock on arrival",
+        )?;
+        let fx = real(
+            "fx",
+            0.0,
+            "focal length x, px; 0 = width / 2 (about 90 deg HFOV)",
+        )?;
+        let fy = real("fy", 0.0, "focal length y, px; 0 = same as fx")?;
+        let cx = real("cx", 0.0, "principal point x, px; 0 = image centre")?;
+        let cy = real("cy", 0.0, "principal point y, px; 0 = image centre")?;
+        let imu_to_camera_rpy_deg = real_array(
+            "imu_to_camera_rpy_deg",
+            &DEFAULT_IMU_TO_CAMERA_RPY_DEG,
+            "TF rotation parent = IMU frame, child = camera optical frame, as roll pitch yaw in \
+             degrees",
+        )?;
+        let imu_time_offset_ms = real(
+            "imu_time_offset_ms",
+            0.0,
+            "added to each frame's capture stamp to find it on the IMU timeline",
+        )?;
+        let smoothing_time_constant_s = real(
+            "smoothing_time_constant_s",
+            DEFAULT_SMOOTHING_TAU_S,
+            "low-pass time constant the virtual camera follows the real one with",
+        )?;
+        let zoom = real(
+            "zoom",
+            DEFAULT_ZOOM,
+            "output magnification hiding the borders the warp uncovers; 1.0 to 2.0",
+        )?;
+        let max_imu_wait_ms = real(
+            "max_imu_wait_ms",
+            DEFAULT_MAX_IMU_WAIT_MS,
+            "how long a frame waits for an IMU sample newer than itself; 0 to 50",
+        )?;
+        let imu_accel_scale = real(
+            "imu_accel_scale",
+            DEFAULT_ACCEL_SCALE,
+            "multiplies linear_acceleration into m/s^2 (Livox reports g)",
+        )?;
+        let mahony_kp = real(
+            "mahony_kp",
+            DEFAULT_MAHONY_KP,
+            "accelerometer correction gain of the orientation filter; 0 = gyro only",
+        )?;
+
         let mut warn = |message: String| log_warn!(node.logger(), "[Parameters] {message}");
 
         let framerate_value = positive("framerate", framerate.get(), DEFAULT_FRAMERATE, &mut warn);
+        let width_value = positive("width", width.get(), DEFAULT_WIDTH, &mut warn);
+        let height_value = positive("height", height.get(), DEFAULT_HEIGHT, &mut warn);
+        let ros_framerate_value = ros_rate(ros_framerate.get(), framerate_value);
+        let exposure_value = exposure(auto_exposure.get(), exposure_time.get(), &mut warn);
+
+        let stabilize_config = stabilize.get().then(|| {
+            if ros_framerate_value >= framerate_value {
+                warn(format!(
+                    "stabilize is on with no lower ros_framerate: every frame is decoded, warped \
+                     and re-encoded at {framerate_value} fps"
+                ));
+            }
+            let intrinsics = intrinsics(
+                [fx.get(), fy.get(), cx.get(), cy.get()],
+                width_value,
+                height_value,
+                &mut warn,
+            );
+            let zoom = bounded("zoom", zoom.get(), 1.0, MAX_ZOOM, DEFAULT_ZOOM, &mut warn);
+            let offset_ms = bounded(
+                "imu_time_offset_ms",
+                imu_time_offset_ms.get(),
+                -MAX_IMU_TIME_OFFSET_MS,
+                MAX_IMU_TIME_OFFSET_MS,
+                0.0,
+                &mut warn,
+            );
+            let wait_ms = bounded(
+                "max_imu_wait_ms",
+                max_imu_wait_ms.get(),
+                0.0,
+                MAX_IMU_WAIT_MS,
+                DEFAULT_MAX_IMU_WAIT_MS,
+                &mut warn,
+            );
+            StabilizeConfig {
+                imu_topic: imu_topic.get().to_string(),
+                imu_use_header_stamp: imu_use_header_stamp.get(),
+                eis: EisConfig {
+                    intrinsics,
+                    width: width_value,
+                    height: height_value,
+                    zoom,
+                    smoothing_tau_s: positive_real(
+                        "smoothing_time_constant_s",
+                        smoothing_time_constant_s.get(),
+                        DEFAULT_SMOOTHING_TAU_S,
+                        &mut warn,
+                    ),
+                    cam_from_imu: cam_from_imu(&imu_to_camera_rpy_deg.get(), &mut warn),
+                },
+                frame_time_offset_ns: frame_time_offset_ns(offset_ms, exposure_value),
+                max_imu_wait: Duration::from_secs_f64(wait_ms / 1000.0),
+                accel_scale: positive_real(
+                    "imu_accel_scale",
+                    imu_accel_scale.get(),
+                    DEFAULT_ACCEL_SCALE,
+                    &mut warn,
+                ),
+                mahony: MahonyGains {
+                    kp: bounded(
+                        "mahony_kp",
+                        mahony_kp.get(),
+                        0.0,
+                        MAX_MAHONY_KP,
+                        DEFAULT_MAHONY_KP,
+                        &mut warn,
+                    ),
+                    ki: 0.0,
+                },
+            }
+        });
+
         let config = Config {
             pipeline: PipelineConfig {
                 device: device.get().to_string(),
-                width: positive("width", width.get(), DEFAULT_WIDTH, &mut warn),
-                height: positive("height", height.get(), DEFAULT_HEIGHT, &mut warn),
+                width: width_value,
+                height: height_value,
                 framerate: framerate_value,
                 rtp_host: rtp_host.get().to_string(),
                 rtp_port: port(rtp_port.get(), &mut warn),
-                ros_framerate: ros_rate(ros_framerate.get(), framerate_value),
+                ros_framerate: ros_framerate_value,
                 source_override: source_override.get().to_string(),
                 sensor_controls: SensorControls {
-                    exposure: exposure(auto_exposure.get(), exposure_time.get(), &mut warn),
+                    exposure: exposure_value,
                     white_balance: white_balance(
                         white_balance_automatic.get(),
                         white_balance_temperature.get(),
@@ -147,11 +337,12 @@ impl Parameters {
                 },
             },
             frame_id: frame_id.get().to_string(),
+            stabilize: stabilize_config,
         };
 
         Ok((
             Self {
-                _text: vec![device, rtp_host, frame_id, source_override],
+                _text: vec![device, rtp_host, frame_id, source_override, imu_topic],
                 _integer: vec![
                     width,
                     height,
@@ -166,9 +357,112 @@ impl Parameters {
                     brightness,
                     power_line_frequency,
                 ],
+                _real: vec![
+                    fx,
+                    fy,
+                    cx,
+                    cy,
+                    imu_time_offset_ms,
+                    smoothing_time_constant_s,
+                    zoom,
+                    max_imu_wait_ms,
+                    imu_accel_scale,
+                    mahony_kp,
+                ],
+                _real_array: vec![imu_to_camera_rpy_deg],
+                _flag: vec![stabilize, imu_use_header_stamp],
             },
             config,
         ))
+    }
+}
+
+/// `fx fy cx cy`, with 0 standing for the resolution-derived guess: a focal length of half the
+/// width (about 90° horizontal field of view) and the principal point at the image centre. The
+/// guess is for bringing the path up; stabilizing well needs a calibrated value.
+fn intrinsics(
+    [fx, fy, cx, cy]: [f64; 4],
+    width: u32,
+    height: u32,
+    warn: &mut impl FnMut(String),
+) -> Intrinsics {
+    let (w, h) = (f64::from(width), f64::from(height));
+    let fx = if fx == 0.0 {
+        w / 2.0
+    } else {
+        positive_real("fx", fx, w / 2.0, warn)
+    };
+    let fy = if fy == 0.0 {
+        fx
+    } else {
+        positive_real("fy", fy, fx, warn)
+    };
+    let cx = if cx == 0.0 {
+        w / 2.0
+    } else {
+        bounded("cx", cx, 0.0, w, w / 2.0, warn)
+    };
+    let cy = if cy == 0.0 {
+        h / 2.0
+    } else {
+        bounded("cy", cy, 0.0, h, h / 2.0, warn)
+    };
+    Intrinsics { fx, fy, cx, cy }
+}
+
+/// The rotation taking IMU-frame vectors into the optical frame: the transpose of the TF
+/// rotation (parent = IMU, child = camera) the parameter spells out.
+fn cam_from_imu(rpy_deg: &[f64], warn: &mut impl FnMut(String)) -> Mat3 {
+    let [roll, pitch, yaw] = match rpy_deg {
+        [r, p, y] if [r, p, y].iter().all(|v| v.is_finite()) => [*r, *p, *y],
+        other => {
+            warn(format!(
+                "imu_to_camera_rpy_deg={other:?} is not three finite angles; using \
+                 {DEFAULT_IMU_TO_CAMERA_RPY_DEG:?}"
+            ));
+            DEFAULT_IMU_TO_CAMERA_RPY_DEG
+        }
+    };
+    Mat3::from_rpy_deg(roll, pitch, yaw).transpose()
+}
+
+/// The capture stamp marks the start of exposure; the orientation that shaped the frame is the
+/// one halfway through it. In auto exposure the time is unknown and the offset parameter has to
+/// absorb it.
+fn frame_time_offset_ns(offset_ms: f64, exposure: Exposure) -> i64 {
+    let half_exposure_ns = match exposure {
+        Exposure::Auto => 0,
+        Exposure::Manual { time_100us } => i64::from(time_100us) * 50_000,
+    };
+    (offset_ms * 1e6) as i64 + half_exposure_ns
+}
+
+fn positive_real(name: &str, value: f64, default: f64, warn: &mut impl FnMut(String)) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        warn(format!(
+            "{name}={value} is not a positive value; using {default}"
+        ));
+        default
+    }
+}
+
+fn bounded(
+    name: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+    default: f64,
+    warn: &mut impl FnMut(String),
+) -> f64 {
+    if value.is_finite() && (min..=max).contains(&value) {
+        value
+    } else {
+        warn(format!(
+            "{name}={value} is outside {min}..={max}; using {default}"
+        ));
+        default
     }
 }
 
@@ -364,5 +658,77 @@ mod tests {
         assert_eq!(ros_rate(60, 60), 60);
         assert_eq!(ros_rate(120, 60), 60);
         assert_eq!(ros_rate(30, 60), 30);
+    }
+
+    #[test]
+    fn zero_intrinsics_mean_the_resolution_derived_guess() {
+        let k = intrinsics([0.0; 4], 1280, 720, &mut ignore);
+        assert_eq!(
+            k,
+            Intrinsics {
+                fx: 640.0,
+                fy: 640.0,
+                cx: 640.0,
+                cy: 360.0
+            }
+        );
+        // fy follows a given fx.
+        let k = intrinsics([900.0, 0.0, 0.0, 0.0], 1280, 720, &mut ignore);
+        assert_eq!(k.fy, 900.0);
+    }
+
+    #[test]
+    fn bad_intrinsics_fall_back_with_a_warning() {
+        let mut warnings = Vec::new();
+        let k = intrinsics([-1.0, f64::NAN, 5000.0, 100.0], 1280, 720, &mut |m| {
+            warnings.push(m)
+        });
+        assert_eq!(k.fx, 640.0);
+        assert_eq!(k.fy, 640.0);
+        assert_eq!(k.cx, 640.0);
+        assert_eq!(k.cy, 100.0);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    #[test]
+    fn the_imu_to_camera_rotation_takes_body_forward_to_optical_z() {
+        let c = cam_from_imu(&DEFAULT_IMU_TO_CAMERA_RPY_DEG, &mut ignore);
+        let forward = c.mul_vec([1.0, 0.0, 0.0]);
+        assert!((forward[2] - 1.0).abs() < 1e-9, "{forward:?}");
+        // Body "up" is optical -y.
+        let up = c.mul_vec([0.0, 0.0, 1.0]);
+        assert!((up[1] + 1.0).abs() < 1e-9, "{up:?}");
+    }
+
+    #[test]
+    fn a_malformed_rotation_falls_back_to_the_default() {
+        let mut warnings = Vec::new();
+        let c = cam_from_imu(&[1.0, 2.0], &mut |m| warnings.push(m));
+        assert_eq!(c, cam_from_imu(&DEFAULT_IMU_TO_CAMERA_RPY_DEG, &mut ignore));
+        assert_eq!(warnings.len(), 1);
+        let c = cam_from_imu(&[0.0, f64::INFINITY, 0.0], &mut |m| warnings.push(m));
+        assert_eq!(c, cam_from_imu(&DEFAULT_IMU_TO_CAMERA_RPY_DEG, &mut ignore));
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn the_frame_time_offset_adds_half_the_manual_exposure() {
+        assert_eq!(frame_time_offset_ns(0.0, Exposure::Auto), 0);
+        assert_eq!(frame_time_offset_ns(-12.5, Exposure::Auto), -12_500_000);
+        // 330 x 100 us = 33 ms of exposure: half is 16.5 ms.
+        assert_eq!(
+            frame_time_offset_ns(0.0, Exposure::Manual { time_100us: 330 }),
+            16_500_000
+        );
+    }
+
+    #[test]
+    fn bounded_values_fall_back_outside_their_range() {
+        assert_eq!(bounded("zoom", 1.3, 1.0, 2.0, 1.15, &mut ignore), 1.3);
+        assert_eq!(bounded("zoom", 0.9, 1.0, 2.0, 1.15, &mut ignore), 1.15);
+        assert_eq!(bounded("zoom", 2.5, 1.0, 2.0, 1.15, &mut ignore), 1.15);
+        assert_eq!(bounded("zoom", f64::NAN, 1.0, 2.0, 1.15, &mut ignore), 1.15);
+        assert_eq!(positive_real("tau", 0.0, 0.5, &mut ignore), 0.5);
+        assert_eq!(positive_real("tau", 0.2, 0.5, &mut ignore), 0.2);
     }
 }

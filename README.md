@@ -11,6 +11,16 @@ camera at the same time:
                                                            └─ appsink ─► <robot_id>/image_raw/compressed ──► ros2 bag record
 ```
 
+With `stabilize: true` the same two branches are fed by a gyro-stabilized image instead
+(electronic image stabilization from the lidar's IMU, Karpenko-style: rotation only, CPU warp):
+
+```
+v4l2src (MJPEG @60) ── videorate @30 ── jpegdec ── appsink ─┐
+                                        <robot_id>/livox/imu ─┤ warp by the orientation at capture time (Rust)
+                       appsrc ── jpegenc ── tee ─┬─ rtpjpegpay ─ udpsink ◄┘
+                                                 └─ appsink ─► image_raw/compressed
+```
+
 The design, the alternatives that were rejected (v4l2loopback, shm, the worker as owner) and the
 changes it needs in the other repos are in [PROPOSAL.md](PROPOSAL.md) (Chinese).
 
@@ -25,10 +35,15 @@ a pipeline error). Not yet run against the real camera on the robot.
 | Publish | `image_raw/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | 30 Hz (`ros_framerate`); SensorData QoS (best effort, keep last 5), as `vizionsdk_ros2` published it |
 | Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | 60 Hz (`framerate`), for the WebRTC worker's `rtpjpeg` source |
 
-- **Nothing is decoded.** The camera's JPEG bytes go to both branches untouched, each behind its
-  own leaky queue so neither consumer can stall the capture or the other.
+- **Nothing is decoded** (by default). The camera's JPEG bytes go to both branches untouched, each
+  behind its own leaky queue so neither consumer can stall the capture or the other.
+- **Stabilization** (`stabilize: true`, off by default) decodes, warps and re-encodes every frame
+  on the CPU at `ros_framerate`, so both branches then run at 30 fps. It needs the camera
+  intrinsics and the IMU-to-camera rotation calibrated; the parameters file explains each knob.
+  Without IMU samples the frames pass through (zoomed, unwarped) and a throttled warning says so.
 - **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
-  pipeline clock (`src/camera_feeder_node/stamp.rs`).
+  pipeline clock (`src/camera_feeder_node/stamp.rs`); with stabilization on, the stamp computed
+  on the capture pipeline travels to the output pipeline's appsink keyed by PTS.
 - **ISP controls** (exposure, white balance, gain, flicker) are written once at capture start with
   the WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
 - **On any pipeline error the node exits** and the launch file respawns it.

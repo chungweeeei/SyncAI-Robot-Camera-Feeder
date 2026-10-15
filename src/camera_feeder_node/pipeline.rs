@@ -6,6 +6,20 @@
 
 /// The appsink feeding `image_raw/compressed`; the node looks it up by this name.
 pub const ROS_SINK_NAME: &str = "ros";
+/// The appsink at the end of the stabilized capture pipeline, where the decoded I420 frames come
+/// out to be warped.
+pub const RAW_SINK_NAME: &str = "raw";
+/// The appsrc at the head of the stabilized output pipeline, where the warped frames go in.
+pub const WARPED_SRC_NAME: &str = "warped";
+
+/// The two descriptions of the stabilized path. `capture` ends in the raw appsink and `output`
+/// starts at the appsrc the warp feeds; the Rust warp (`warp_bridge.rs`) is the bridge between
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StabilizedPipelines {
+    pub capture: String,
+    pub output: String,
+}
 
 /// Default manual exposure, in 100 µs units (33 ms). Only applies to [`Exposure::Manual`].
 pub const DEFAULT_EXPOSURE_TIME_100US: u32 = 330;
@@ -163,7 +177,60 @@ const LEAKY_QUEUE: &str =
 /// time only adds latency.
 #[must_use]
 pub fn build_pipeline_string(config: &PipelineConfig) -> String {
-    let source = if config.source_override.trim().is_empty() {
+    let source = capture_head(config);
+    let rtp_branch = rtp_branch(config);
+    let rate_limit = rate_limit(config);
+    let ros_branch = format!("t. ! {LEAKY_QUEUE}{rate_limit} ! {}", ros_appsink());
+
+    format!("{source} ! tee name=t {rtp_branch} {ros_branch}")
+}
+
+/// The two descriptions of the stabilized path (`stabilize: true`).
+///
+/// ```text
+/// capture: v4l2src ! image/jpeg [! videorate] ! queue ! jpegdec ! I420 ! appsink name=raw
+///                                                        │ Rust: warp by the IMU orientation
+/// output:  appsrc name=warped ! jpegenc ! tee ─┬─ queue ! rtpjpegpay ! udpsink
+///                                              └─ queue ! appsink name=ros
+/// ```
+///
+/// The rate limit sits *before* the decoder, so only `ros_framerate` frames per second are
+/// decoded, warped and re-encoded — and the RTP branch, downstream of the warp, carries that rate
+/// too rather than `framerate`. The queue in front of `jpegdec` moves decoding off the capture
+/// thread and drops rather than blocks when the warp falls behind, as the tee queues do.
+///
+/// `jpegdec` (1.20) emits I420 for every YCbCr JPEG, 4:2:2 included (it halves the chroma rows),
+/// so the `format=I420` caps are an assertion the warp relies on, not a conversion.
+///
+/// The appsrc is live with `do-timestamp=false`: the warp sets each buffer's PTS to the capture
+/// pipeline's, so running time stays monotonic for `rtpjpegpay`. `block=false` with a leaky
+/// two-buffer queue inside the appsrc: a slow encoder loses frames, never stalls the warp.
+#[must_use]
+pub fn build_stabilized_pipelines(config: &PipelineConfig) -> StabilizedPipelines {
+    let capture = format!(
+        "{}{} ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! jpegdec ! video/x-raw,format=I420 \
+         ! appsink name={RAW_SINK_NAME} sync=false max-buffers=1 drop=true",
+        capture_head(config),
+        rate_limit(config),
+    );
+    let output = format!(
+        "appsrc name={WARPED_SRC_NAME} is-live=true format=time do-timestamp=false block=false \
+         max-buffers=2 max-bytes=0 leaky-type=downstream \
+         caps=\"video/x-raw,format=I420,width={},height={},framerate={}/1\" \
+         ! jpegenc ! tee name=t {} t. ! {LEAKY_QUEUE} ! {}",
+        config.width,
+        config.height,
+        config.ros_framerate,
+        rtp_branch(config),
+        ros_appsink(),
+    );
+    StabilizedPipelines { capture, output }
+}
+
+/// `v4l2src ! image/jpeg,…`, or the override in its place.
+fn capture_head(config: &PipelineConfig) -> String {
+    if config.source_override.trim().is_empty() {
         format!(
             "v4l2src device=\"{}\" io-mode=2 extra-controls=\"{}\" \
              ! image/jpeg,width={},height={},framerate={}/1",
@@ -175,29 +242,33 @@ pub fn build_pipeline_string(config: &PipelineConfig) -> String {
         )
     } else {
         config.source_override.trim().to_string()
-    };
+    }
+}
 
-    let rtp_branch = format!(
+fn rtp_branch(config: &PipelineConfig) -> String {
+    format!(
         "t. ! {LEAKY_QUEUE} ! rtpjpegpay pt=26 \
          ! udpsink host=\"{}\" port={} sync=false async=false",
         config.rtp_host, config.rtp_port,
-    );
+    )
+}
 
-    // drop-only: videorate may only drop frames to reach the lower rate, never duplicate one.
-    let rate_limit = if config.ros_framerate < config.framerate {
+/// ` ! videorate …` down to `ros_framerate`, or nothing when every frame is carried.
+///
+/// drop-only: videorate may only drop frames to reach the lower rate, never duplicate one.
+fn rate_limit(config: &PipelineConfig) -> String {
+    if config.ros_framerate < config.framerate {
         format!(
             " ! videorate drop-only=true ! image/jpeg,framerate={}/1",
             config.ros_framerate
         )
     } else {
         String::new()
-    };
-    let ros_branch = format!(
-        "t. ! {LEAKY_QUEUE}{rate_limit} \
-         ! appsink name={ROS_SINK_NAME} sync=false max-buffers=2 drop=true"
-    );
+    }
+}
 
-    format!("{source} ! tee name=t {rtp_branch} {ros_branch}")
+fn ros_appsink() -> String {
+    format!("appsink name={ROS_SINK_NAME} sync=false max-buffers=2 drop=true")
 }
 
 #[cfg(test)]
@@ -336,5 +407,96 @@ mod tests {
         );
         assert!(!out.contains("v4l2src"), "{out}");
         assert!(!out.contains("extra-controls"), "{out}");
+    }
+
+    fn stabilized_config() -> PipelineConfig {
+        PipelineConfig {
+            ros_framerate: 30,
+            ..config()
+        }
+    }
+
+    #[test]
+    fn stabilized_capture_rate_limits_before_decoding_into_the_raw_sink() {
+        let StabilizedPipelines { capture, .. } = build_stabilized_pipelines(&stabilized_config());
+        assert!(
+            capture.starts_with("v4l2src device=\"/dev/syncai/camera0\" io-mode=2"),
+            "{capture}"
+        );
+        let videorate = capture
+            .find("videorate drop-only=true ! image/jpeg,framerate=30/1")
+            .unwrap();
+        let queue = capture.find("queue max-size-buffers=2").unwrap();
+        let decoder = capture.find("jpegdec ! video/x-raw,format=I420").unwrap();
+        assert!(videorate < queue && queue < decoder, "{capture}");
+        assert_eq!(capture.matches("leaky=downstream").count(), 1, "{capture}");
+        assert!(
+            capture.ends_with(&format!(
+                "appsink name={RAW_SINK_NAME} sync=false max-buffers=1 drop=true"
+            )),
+            "{capture}"
+        );
+        assert!(!capture.contains("tee"), "{capture}");
+        assert!(!capture.contains("do-timestamp"), "{capture}");
+    }
+
+    #[test]
+    fn stabilized_output_encodes_into_both_branches_at_the_ros_rate() {
+        let StabilizedPipelines { output, .. } = build_stabilized_pipelines(&stabilized_config());
+        assert!(
+            output.starts_with(&format!(
+                "appsrc name={WARPED_SRC_NAME} is-live=true format=time do-timestamp=false"
+            )),
+            "{output}"
+        );
+        assert!(
+            output
+                .contains("caps=\"video/x-raw,format=I420,width=1280,height=720,framerate=30/1\""),
+            "{output}"
+        );
+        assert!(output.contains("! jpegenc ! tee name=t"), "{output}");
+        assert!(
+            output.contains("rtpjpegpay pt=26 ! udpsink host=\"127.0.0.1\" port=5008"),
+            "{output}"
+        );
+        assert!(
+            output.ends_with(&format!(
+                "appsink name={ROS_SINK_NAME} sync=false max-buffers=2 drop=true"
+            )),
+            "{output}"
+        );
+        assert_eq!(output.matches("leaky=downstream").count(), 2, "{output}");
+        // The whole path already runs at ros_framerate; no second rate limit.
+        assert!(!output.contains("videorate"), "{output}");
+    }
+
+    #[test]
+    fn stabilized_at_full_rate_decodes_every_frame() {
+        let StabilizedPipelines { capture, output } = build_stabilized_pipelines(&config());
+        assert!(!capture.contains("videorate"), "{capture}");
+        assert!(output.contains("framerate=60/1"), "{output}");
+    }
+
+    #[test]
+    fn stabilized_capture_honours_the_source_override() {
+        let StabilizedPipelines { capture, .. } = build_stabilized_pipelines(&PipelineConfig {
+            source_override: "videotestsrc is-live=true ! jpegenc".to_string(),
+            ..stabilized_config()
+        });
+        assert!(
+            capture.starts_with("videotestsrc is-live=true ! jpegenc ! videorate"),
+            "{capture}"
+        );
+        assert!(!capture.contains("v4l2src"), "{capture}");
+    }
+
+    #[test]
+    fn the_branches_are_the_same_in_both_modes() {
+        // The RTP branch and the ROS appsink come from the same helpers, so a change to one mode
+        // cannot silently diverge from the other.
+        let passthrough = build_pipeline_string(&config());
+        let StabilizedPipelines { output, .. } = build_stabilized_pipelines(&config());
+        let branch = |s: &str| s[s.find("t. !").unwrap()..].to_string();
+        assert_eq!(branch(&passthrough), branch(&output));
     }
 }
