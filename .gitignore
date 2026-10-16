@@ -15,3 +15,6 @@ target/
 
 # Claude Code per-user settings
 .claude/settings.local.json
+
+# ros2 bag file
+record/

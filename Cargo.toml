@@ -22,6 +22,11 @@ ros-env = "0.2"
 # (the same trap the WebRTC worker's go-gst pin documents).
 gstreamer = { version = "0.24", features = ["v1_20"] }
 gstreamer-app = { version = "0.24", features = ["v1_20"] }
+# Only the stabilized path uses it (VideoInfo / VideoFrameRef for the raw I420 frames); same pin.
+gstreamer-video = { version = "0.24", features = ["v1_20"] }
+# Row-parallel warp. nalgebra / an AHRS crate would have been the natural fit for the math, but
+# every release that still builds on rustc 1.85 is two major versions old; math.rs is ~150 lines.
+rayon = "1"
 
 # Install launch/ and params/ into share/syncai_camera_feeder/ so the launch file finds them
 [package.metadata.ros]

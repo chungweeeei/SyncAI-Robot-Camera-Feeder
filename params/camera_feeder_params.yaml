@@ -48,3 +48,67 @@
     brightness: 16
     # 0 = off, 1 = 50 Hz, 2 = 60 Hz. The camera ships with it off, and mains lighting then bands.
     power_line_frequency: 1
+
+    # --- Stabilization (gyro-based EIS) ---
+    # With stabilize on, the capture is rate-limited to ros_framerate, decoded, warped by the IMU
+    # orientation at each frame's capture time and re-encoded before the tee (the warp on the CPU,
+    # the JPEG codec as jpeg_codec below says): BOTH the RTP and the ROS branch carry the
+    # stabilized image, and the RTP branch then runs at ros_framerate rather than framerate. Off
+    # (the default), the pipeline is the untouched MJPEG passthrough above. Leave it off until
+    # fx/fy/cx/cy and imu_to_camera_rpy_deg are calibrated.
+    stabilize: false
+    # sensor_msgs/Imu, relative so it is <robot_id>/livox/imu: the lidar's IMU (200 Hz, hardware
+    # stamped). Only rotation is used, so any IMU rigidly mounted with the camera will do.
+    imu_topic: "livox/imu"
+    # true: samples are placed on the timeline by header.stamp (which must be in the same time base
+    # as this node's clock). false: by this node's clock when the sample arrives.
+    imu_use_header_stamp: true
+    # Pinhole intrinsics in pixels. 0 means the guess derived from the resolution (fx = fy =
+    # width/2, about 90 deg horizontal FOV; principal point at the centre).
+    #
+    # The values below (fx, imu_to_camera_rpy_deg, imu_time_offset_ms, zoom) come from an offline
+    # fit on the bag record/dp1f_1013_with_image (robot01, 2026-10-13): the per-frame image shift
+    # against the yaw rate gives fx ~ 675 px, and a sweep of the other three minimised the
+    # residual far-field shake. They are a working set, not a calibration: a checkerboard run
+    # (camera_calibration on image_raw/compressed) should replace fx/fy/cx/cy, and the lens's
+    # barrel distortion is not modelled at all.
+    fx: 675.0
+    fy: 675.0
+    cx: 0.0
+    cy: 0.0
+    # The TF rotation parent = IMU frame, child = camera optical frame, as roll pitch yaw in
+    # degrees (tf2 / URDF convention). [-90, 0, -90] is a camera whose axes are aligned with a
+    # REP-103 body-frame IMU (x forward, y left, z up). The lidar (and so its IMU) is pitched
+    # 0.25 rad on base_link; the fit prefers that 14.3 deg taken back out, which in rpy is
+    # [-75.7, 0, -90] (the optical axis then points 14.3 deg above the lidar's x axis).
+    imu_to_camera_rpy_deg: [-75.7, 0.0, -90.0]
+    # Added to each frame's capture stamp to find it on the IMU's timeline (USB latency, clock
+    # offset). Half the exposure time is added automatically in manual exposure. Sweep it while
+    # rocking the robot and keep the value with the least residual shake (the bag fit: +10 ms,
+    # flat between +5 and +15).
+    imu_time_offset_ms: 10.0
+    # Time constant (s) of the low-pass the virtual camera follows the real one with. Larger is
+    # steadier and lags further behind real pans.
+    smoothing_time_constant_s: 0.5
+    # Output magnification, 1.0 to 2.0: the border it crops is what hides the warp. 1.3 hides
+    # about 7 degrees of correction at fx 675 (1.15 hid only 4, which the robot's 0.5 rad/s turns
+    # exhausted); beyond that the correction is clamped rather than showing black.
+    zoom: 1.3
+    # How long a frame waits (ms, 0 to 50) for an IMU sample newer than itself before the last
+    # gyro reading is extrapolated instead.
+    max_imu_wait_ms: 5.0
+    # Multiplies linear_acceleration into m/s^2. Livox reports g; set 1.0 for an SI source.
+    imu_accel_scale: 9.80665
+    # Accelerometer correction gain of the orientation filter (Mahony kp); 0 is gyro-only.
+    mahony_kp: 0.5
+    # Who decodes and re-encodes the frames when stabilize is on (the passthrough decodes nothing).
+    #   auto     - the Jetson's hardware JPEG (nvv4l2decoder ! nvvidconv, and nvjpegenc) when
+    #              GStreamer has those elements, i.e. in a container under the nvidia runtime;
+    #              jpegdec / jpegenc on the CPU otherwise (the Dev Container). The startup log says
+    #              which it picked.
+    #   nvidia   - the hardware chain, or a startup error naming the missing elements.
+    #   software - always the CPU.
+    # Measured in robot01 (AGX Orin, this camera, stabilize on at 30 fps): the node fell from ~2.5
+    # to ~1.9 cores, and a frame's age when it reaches ROS from ~53 ms to ~35 ms. The image is the
+    # same (both encoders run at quality 85).
+    jpeg_codec: "auto"

@@ -59,7 +59,17 @@ ros2 run syncai_camera_feeder camera_feeder_node --ros-args -r __ns:=/default_ro
 Keep `format=YUY2` (or `I420`). Left to negotiate, `videotestsrc` picks a format whose JPEG chroma
 sampling RTP/JPEG cannot carry, and `rtpjpegpay` rejects every frame with "Invalid component"
 while the ROS branch keeps working — which looks like a broken RTP path rather than a test-source
-problem. On the robot, add `--device=/dev/syncai/camera0` to
+problem.
+
+The stabilized path runs in the Dev Container too (`stabilize:=true` plus the same
+`source_override`), with a fake IMU; `pattern=ball` makes the warp visible and
+`imu_use_header_stamp:=false` is needed because `ros2 topic pub` leaves `header.stamp` at zero:
+
+```bash
+ros2 topic pub -r 200 /default_robot/livox/imu sensor_msgs/msg/Imu "{header: {frame_id: livox_frame}, angular_velocity: {z: 0.3}, linear_acceleration: {z: 1.0}}"
+# expect image_raw/compressed at 30 Hz, the RTP receiver at ~30 fps, a "stabilizing" log line, and a
+# throttled "no IMU samples" warning (with the stream continuing) once the publisher is stopped
+``` On the robot, add `--device=/dev/syncai/camera0` to
 `runArgs` in `devcontainer.json` (it is not there by default because Docker refuses to start a
 container whose device is missing).
 
@@ -72,16 +82,38 @@ container whose device is missing).
 | `pipeline.rs` | **Pure** pipeline description and `extra-controls` string; unit-tested |
 | `stamp.rs` | **Pure** capture-stamp math (node clock now − frame age on the pipeline clock); unit-tested |
 | `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
+| `math.rs` | **Pure** `Quat` / `Mat3` (no nalgebra: nothing current builds on rustc 1.85); unit-tested |
+| `imu.rs` | **Pure** Mahony filter and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |
+| `eis.rs` | **Pure** stabilizer: smoothing, clamp to what the zoom hides, `H = K_out · R · K⁻¹`; unit-tested |
+| `warp.rs` | **Pure** I420 bilinear inverse warp, row-parallel with rayon; unit-tested |
+| `warp_bridge.rs` | The raw appsink callback bridging the two stabilized pipelines (GStreamer glue around the pure modules) |
 
 New logic that can be expressed over plain Rust types goes in a pure module with unit tests.
 
-**Threading:** no rclrs worker or timer. Frames are published from the appsink's GStreamer
-streaming thread (an rclrs `Publisher` is an `Arc`, `publish(&self)`), the bus is polled on its
-own thread, and the executor only spins so the node is in the graph and serves its parameters.
-The appsink callback must not capture the `gst::Pipeline`: the pipeline owns the appsink, the
-appsink owns the callback, and a captured pipeline is a reference cycle that is never freed. Read
-the clock and base time off the `sink` argument instead (the pipeline distributes both to every
-element).
+**Stabilization (`stabilize: true`)** is gyro-based EIS: the capture pipeline is rate-limited to
+`ros_framerate`, decodes to system-memory I420 and ends in a raw appsink; the warp maps each
+frame into a low-passed "virtual camera" using the IMU orientation at the frame's capture time; an
+output pipeline (`appsrc ! <encoder> ! tee`) carries the usual two branches, both now at
+`ros_framerate`. The decoder and encoder are the `jpeg_codec`'s (see "Hardware JPEG" below).
+`pipeline.rs` renders both descriptions (`build_stabilized_pipelines`) from the same branch
+helpers as the passthrough string, which stays byte-for-byte what it was when `stabilize` is off.
+The capture stamp is computed on the capture pipeline and handed to the output appsink in a
+PTS-keyed table (`StampTable`), because the two pipelines have different clocks and base times.
+Frames without an orientation (no IMU yet, IMU stale) pass through zoomed but unwarped, with a
+throttled warning; the pipeline never stalls on the IMU.
+
+**Threading:** no rclrs worker or timer. The one executor callback is the IMU subscription
+(`node.create_subscription`, only with `stabilize` on); it runs on the executor thread `main.rs`
+spins and does nothing but push the sample into the `Arc<(Mutex<ImuBuffer>, Condvar)>` shared
+with the warp. Frames are published from an appsink's GStreamer streaming thread (an rclrs
+`Publisher` is an `Arc`, `publish(&self)`); the warp runs on the capture pipeline's streaming
+thread, fanned out across rayon's workers, and pushes into the output pipeline's `appsrc`. Each
+pipeline's bus is polled on its own thread, and the executor otherwise only spins so the node is
+in the graph and serves its parameters. An appsink callback must not capture a `gst::Pipeline`:
+the pipeline owns the appsink, the appsink owns the callback, and a captured pipeline is a
+reference cycle that is never freed. Read the clock and base time off the `sink` argument instead
+(the pipeline distributes both to every element). Holding the other pipeline's `AppSrc` is fine:
+a child element does not own its parent.
 
 **ISP modes are enums** (`Exposure`, `WhiteBalance`, `PowerLineFrequency` in `pipeline.rs`), not the
 raw V4L2 numbers, because the two auto switches have opposite polarity. Raw numbers exist only
@@ -93,18 +125,49 @@ another process, `not-negotiated`, camera unplugged) ends the process with code 
 file's `respawn=True` restarts it 2 s later. Do not add in-process pipeline rebuilding: a fresh
 process is the one restart that is certain to have released the V4L2 device.
 
-**No hardware acceleration, on purpose.** The pipeline neither decodes nor encodes — JPEG bytes go
-from the camera to both branches untouched — so there is nothing for NVJPG/NVENC to do. Keeping
-Tegra elements out means the robot container needs no nvidia runtime for this node and the Dev
-Container runs the whole pipeline. Transcoding stays in the WebRTC worker.
+**Hardware JPEG on the stabilized path only.** The passthrough pipeline neither decodes nor
+encodes — JPEG bytes go from the camera to both branches untouched — so there is nothing to
+accelerate. The stabilized path decodes and re-encodes, and `jpeg_codec` picks who does it:
+`auto` (the default) asks the GStreamer registry at startup for the L4T chain
+(`NVIDIA_CODEC_ELEMENTS` in `pipeline.rs`: `identity drop-buffer-flags=corrupted !
+nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=I420` and `nvjpegenc`) and falls back to
+plugins-good `jpegdec` / `jpegenc` without it; `nvidia` refuses to start without it; `software`
+never uses it. The L4T plugins are not in any image: the nvidia container runtime bind-mounts them
+from the host, which is why the Workspace's robot container runs `runtime: nvidia` with
+`NVIDIA_DRIVER_CAPABILITIES`, and why the Dev Container (no nvidia runtime) always runs the
+software chain. Measured in robot01 (AGX Orin, JetPack 6 / R36.4, the real camera, a 200 Hz IMU,
+release build) at `ros_framerate` 30: the node fell from ~2.5 to ~1.9 cores (the encoder thread
+from ~28% to ~0; the rest is the rayon warp, which dominates), a frame's age at the warp from ~34
+to ~23 ms and at a ROS subscriber from ~53 to ~35 ms, both at 30.0 Hz; the encoded image is the
+same (both at quality 85). 60 fps stabilized was not pursued: there the hardware codec saved
+nothing measurable (~3.2–3.3 cores either way). Four things the chain depends on:
+
+- **`identity drop-buffer-flags=corrupted` before `nvv4l2decoder`.** The camera starts every
+  stream with four 0-byte buffers flagged CORRUPTED (PTS 0). `nvv4l2decoder` fed one fails with
+  "Failed to process frame" — a bus error, so a respawn — on about half the starts. Never drop it.
+- **No `jpegparse`, anywhere.** It also gets past those buffers, but the 1.20 one discards the
+  capture PTS and interpolates from the caps' framerate, seeded by the first (empty, PTS 0)
+  buffer. Every capture stamp then ran late by the time to the first real frame (~145 ms) plus
+  one frame period per frame dropped upstream — and the warp looked up the wrong IMU instant.
+  Nothing errors; only the "frame age at the warp" stats line shows it. A unit test guards it.
+- **The copy out of NVMM stays.** The warp reads the frame through `VideoFrameRef`, which needs
+  system memory; NVMM would need the NvBufSurface C API (unsafe FFI, forbidden here). That
+  `nvvidconv` copy (~2.5 ms) is most of what the hardware decode still costs. `nvjpegenc` takes
+  system memory directly; an `nvvidconv` to NVMM in front of it was slower.
+- **`nvjpegdec` is not the decoder.** It cannot emit system memory for a 4:2:2 JPEG (this
+  camera's), and through NVMM it was no faster than `jpegdec`.
+
+The first frame after a start is ~370 ms old at the warp while the decoder initialises; it is
+steady from the next stats line on. The warp itself stays on the CPU (rayon); the GPU path for it
+would be VPI, which is not a GStreamer element. Transcoding for WebRTC stays in the worker.
 
 ## GStreamer version pin
 
 The robot container is Ubuntu 22.04 with GStreamer **1.20.3**, and the Tegra elements the WebRTC
-worker uses are built against it, so it will not be upgraded. The crates are built with the
-`v1_20` feature and nothing newer: a higher feature compiles anywhere and then fails to resolve
-symbols when the binary is loaded on the robot. The Dev Container is also 22.04, so it links the
-same 1.20.
+worker uses are built against it, so it will not be upgraded. The crates (`gstreamer`,
+`gstreamer-app`, `gstreamer-video`) are built with the `v1_20` feature and nothing newer: a higher
+feature compiles anywhere and then fails to resolve symbols when the binary is loaded on the
+robot. The Dev Container is also 22.04, so it links the same 1.20.
 
 SyncAI-Robot-Workspace's image currently installs the GStreamer *plugins* but not
 `libgstreamer1.0-dev` / `libgstreamer-plugins-base1.0-dev`; those have to be added there before
