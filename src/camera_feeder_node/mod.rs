@@ -26,6 +26,7 @@ use bus::BusWatch;
 use eis::Stabilizer;
 use imu::{ImuBuffer, ImuSample, SharedImu};
 use parameters::{Parameters, StabilizeConfig};
+use pipeline::{JpegCodec, JpegCodecChoice};
 use stamp::FrameTiming;
 use warp_bridge::{SharedStamps, WarpTiming};
 
@@ -38,7 +39,9 @@ const IMU_HISTORY: usize = 400;
 ///
 /// With `stabilize` on, the capture pipeline instead ends in a raw appsink, each decoded frame is
 /// warped by the IMU orientation at its capture time (`warp_bridge.rs`), and a second, output
-/// pipeline encodes the warped frames and carries the same two branches.
+/// pipeline encodes the warped frames and carries the same two branches. Decoding and encoding
+/// run on the Jetson's hardware JPEG blocks when the L4T plugins are there (`jpeg_codec`), on the
+/// CPU otherwise; the warp is on the CPU either way.
 ///
 /// # Threading
 ///
@@ -56,7 +59,7 @@ pub struct CameraFeederNode {
     _imu_subscription: Option<Subscription<Imu>>,
     /// The capture pipeline: the one that opens the camera.
     pipeline: gst::Pipeline,
-    /// The stabilized path's output pipeline (`appsrc ! jpegenc ! tee …`).
+    /// The stabilized path's output pipeline (`appsrc ! jpegenc|nvjpegenc ! tee …`).
     output_pipeline: Option<gst::Pipeline>,
     _parameters: Parameters,
     node: Node,
@@ -87,7 +90,8 @@ impl CameraFeederNode {
                 (pipeline, None, None)
             }
             Some(stabilize) => {
-                let descriptions = pipeline::build_stabilized_pipelines(&config.pipeline);
+                let codec = jpeg_codec(stabilize.jpeg_codec, node.logger())?;
+                let descriptions = pipeline::build_stabilized_pipelines(&config.pipeline, codec);
                 log_info!(
                     node.logger(),
                     "[CameraFeederNode] capture pipeline: {}",
@@ -205,6 +209,30 @@ impl Drop for CameraFeederNode {
             stop(output, self.node.logger());
         }
     }
+}
+
+/// The stabilized path's codec: `choice` resolved against the elements the GStreamer registry
+/// actually has. Asked of the registry rather than configured, because the same params file runs
+/// on the robot (nvidia runtime, L4T plugins injected) and in the Dev Container (neither).
+fn jpeg_codec(choice: JpegCodecChoice, logger: &Logger) -> Result<JpegCodec, Box<dyn Error>> {
+    let missing =
+        pipeline::missing_nvidia_elements(|name| gst::ElementFactory::find(name).is_some());
+    let codec = pipeline::resolve_codec(choice, &missing)
+        .map_err(|err| format!("[CameraFeederNode] {err}"))?;
+    if choice == JpegCodecChoice::Auto && codec == JpegCodec::Software {
+        log_info!(
+            logger,
+            "[CameraFeederNode] jpeg_codec auto: no {} in this GStreamer, so frames are decoded \
+             and encoded on the CPU",
+            missing.join(" / ")
+        );
+    } else {
+        log_info!(
+            logger,
+            "[CameraFeederNode] jpeg_codec {choice:?}: decoding and encoding with {codec:?}"
+        );
+    }
+    Ok(codec)
 }
 
 fn parse(description: &str) -> Result<gst::Pipeline, Box<dyn Error>> {

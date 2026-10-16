@@ -6,8 +6,8 @@ use super::eis::{EisConfig, Intrinsics};
 use super::imu::MahonyGains;
 use super::math::Mat3;
 use super::pipeline::{
-    DEFAULT_EXPOSURE_TIME_100US, DEFAULT_WHITE_BALANCE_KELVIN, Exposure, PipelineConfig,
-    PowerLineFrequency, SensorControls, WhiteBalance,
+    DEFAULT_EXPOSURE_TIME_100US, DEFAULT_WHITE_BALANCE_KELVIN, Exposure, JpegCodecChoice,
+    PipelineConfig, PowerLineFrequency, SensorControls, WhiteBalance,
 };
 
 const DEFAULT_DEVICE: &str = "/dev/syncai/camera0";
@@ -39,6 +39,7 @@ const MAX_IMU_WAIT_MS: f64 = 50.0;
 const MAX_IMU_TIME_OFFSET_MS: f64 = 500.0;
 const DEFAULT_MAHONY_KP: f64 = 0.5;
 const MAX_MAHONY_KP: f64 = 10.0;
+const DEFAULT_JPEG_CODEC: &str = "auto";
 
 /// The effective values the node runs on, after validation.
 pub struct Config {
@@ -65,6 +66,9 @@ pub struct StabilizeConfig {
     /// Multiplies `linear_acceleration` into m/s².
     pub accel_scale: f64,
     pub mahony: MahonyGains,
+    /// Who decodes and re-encodes the frames; resolved against the GStreamer registry in
+    /// `mod.rs`, since whether the NVIDIA elements exist is not a parameter.
+    pub jpeg_codec: JpegCodecChoice,
 }
 
 /// The node's parameters, all of them load-time only.
@@ -234,6 +238,12 @@ impl Parameters {
             DEFAULT_MAHONY_KP,
             "accelerometer correction gain of the orientation filter; 0 = gyro only",
         )?;
+        let jpeg_codec = text(
+            "jpeg_codec",
+            DEFAULT_JPEG_CODEC,
+            "stabilized path's JPEG decoder/encoder: auto (NVIDIA when its elements exist), \
+             nvidia or software",
+        )?;
 
         let mut warn = |message: String| log_warn!(node.logger(), "[Parameters] {message}");
 
@@ -308,6 +318,7 @@ impl Parameters {
                     ),
                     ki: 0.0,
                 },
+                jpeg_codec: jpeg_codec_choice(&jpeg_codec.get(), &mut warn),
             }
         });
 
@@ -342,7 +353,14 @@ impl Parameters {
 
         Ok((
             Self {
-                _text: vec![device, rtp_host, frame_id, source_override, imu_topic],
+                _text: vec![
+                    device,
+                    rtp_host,
+                    frame_id,
+                    source_override,
+                    imu_topic,
+                    jpeg_codec,
+                ],
                 _integer: vec![
                     width,
                     height,
@@ -544,6 +562,23 @@ fn power_line_frequency_from(value: i64, warn: &mut impl FnMut(String)) -> Power
     }
 }
 
+/// `jpeg_codec`, case and surrounding whitespace ignored. Anything else falls back to auto with a
+/// warning: auto can only ever pick a chain that exists, so it is the one fallback that cannot
+/// stop the camera.
+fn jpeg_codec_choice(value: &str, warn: &mut impl FnMut(String)) -> JpegCodecChoice {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => JpegCodecChoice::Auto,
+        "nvidia" => JpegCodecChoice::Nvidia,
+        "software" => JpegCodecChoice::Software,
+        _ => {
+            warn(format!(
+                "jpeg_codec=\"{value}\" is not auto, nvidia or software; using auto"
+            ));
+            JpegCodecChoice::Auto
+        }
+    }
+}
+
 fn port(value: i64, warn: &mut impl FnMut(String)) -> u16 {
     match u16::try_from(value) {
         Ok(v) if v > 0 => v,
@@ -720,6 +755,29 @@ mod tests {
             frame_time_offset_ns(0.0, Exposure::Manual { time_100us: 330 }),
             16_500_000
         );
+    }
+
+    #[test]
+    fn jpeg_codec_names_are_case_insensitive_and_unknown_ones_mean_auto() {
+        assert_eq!(
+            jpeg_codec_choice("auto", &mut ignore),
+            JpegCodecChoice::Auto
+        );
+        assert_eq!(
+            jpeg_codec_choice(" NVIDIA ", &mut ignore),
+            JpegCodecChoice::Nvidia
+        );
+        assert_eq!(
+            jpeg_codec_choice("Software", &mut ignore),
+            JpegCodecChoice::Software
+        );
+        let mut warnings = Vec::new();
+        assert_eq!(
+            jpeg_codec_choice("nvjpeg", &mut |m| warnings.push(m)),
+            JpegCodecChoice::Auto
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("jpeg_codec"), "{}", warnings[0]);
     }
 
     #[test]

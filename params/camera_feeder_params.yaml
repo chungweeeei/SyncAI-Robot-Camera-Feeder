@@ -51,10 +51,11 @@
 
     # --- Stabilization (gyro-based EIS) ---
     # With stabilize on, the capture is rate-limited to ros_framerate, decoded, warped by the IMU
-    # orientation at each frame's capture time and re-encoded, all on the CPU, before the tee: BOTH
-    # the RTP and the ROS branch carry the stabilized image, and the RTP branch then runs at
-    # ros_framerate rather than framerate. Off (the default), the pipeline is the untouched MJPEG
-    # passthrough above. Leave it off until fx/fy/cx/cy and imu_to_camera_rpy_deg are calibrated.
+    # orientation at each frame's capture time and re-encoded before the tee (the warp on the CPU,
+    # the JPEG codec as jpeg_codec below says): BOTH the RTP and the ROS branch carry the
+    # stabilized image, and the RTP branch then runs at ros_framerate rather than framerate. Off
+    # (the default), the pipeline is the untouched MJPEG passthrough above. Leave it off until
+    # fx/fy/cx/cy and imu_to_camera_rpy_deg are calibrated.
     stabilize: false
     # sensor_msgs/Imu, relative so it is <robot_id>/livox/imu: the lidar's IMU (200 Hz, hardware
     # stamped). Only rotation is used, so any IMU rigidly mounted with the camera will do.
@@ -100,3 +101,14 @@
     imu_accel_scale: 9.80665
     # Accelerometer correction gain of the orientation filter (Mahony kp); 0 is gyro-only.
     mahony_kp: 0.5
+    # Who decodes and re-encodes the frames when stabilize is on (the passthrough decodes nothing).
+    #   auto     - the Jetson's hardware JPEG (nvv4l2decoder ! nvvidconv, and nvjpegenc) when
+    #              GStreamer has those elements, i.e. in a container under the nvidia runtime;
+    #              jpegdec / jpegenc on the CPU otherwise (the Dev Container). The startup log says
+    #              which it picked.
+    #   nvidia   - the hardware chain, or a startup error naming the missing elements.
+    #   software - always the CPU.
+    # Measured in robot01 (AGX Orin, this camera, stabilize on at 30 fps): the node fell from ~2.5
+    # to ~1.9 cores, and a frame's age when it reaches ROS from ~53 ms to ~35 ms. The image is the
+    # same (both encoders run at quality 85).
+    jpeg_codec: "auto"

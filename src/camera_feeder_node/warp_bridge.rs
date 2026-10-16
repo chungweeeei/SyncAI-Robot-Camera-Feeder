@@ -1,12 +1,13 @@
 //! The bridge between the two stabilized pipelines: the raw appsink's callback, which warps each
 //! decoded frame by the IMU orientation and pushes it into the output pipeline's appsrc.
 //!
-//! Runs on the capture pipeline's streaming thread (the queue thread in front of `jpegdec`), with
-//! the warp itself fanned out across rayon's workers. Like `frame_publisher`, it must never
-//! return an error to GStreamer — that would stop the capture — and must not capture either
-//! pipeline: the capture pipeline owns the appsink, the appsink owns this closure, and the
-//! closure owning the pipeline would be a cycle. Holding the output pipeline's *appsrc* is fine:
-//! a child element does not own its parent.
+//! Runs on the capture pipeline's streaming thread that delivers the decoded frames (the queue's
+//! in front of `jpegdec`, or `nvv4l2decoder`'s own output thread), with the warp itself fanned
+//! out across rayon's workers. Like `frame_publisher`, it must never return an error to
+//! GStreamer — that would stop the capture — and must not capture either pipeline: the capture
+//! pipeline owns the appsink, the appsink owns this closure, and the closure owning the pipeline
+//! would be a cycle. Holding the output pipeline's *appsrc* is fine: a child element does not own
+//! its parent.
 //!
 //! Not pure (GStreamer buffers, locks, a clock), so it is kept to glue: the orientation lookup is
 //! `imu.rs`, the homography `eis.rs`, the pixels `warp.rs`, the stamp `stamp.rs`.
@@ -116,6 +117,9 @@ pub fn raw_frame_warper(
             };
             let stamp_ns = stamp::capture_stamp_ns(ros_now, frame_timing);
             let frame_time_ns = stamp_ns.saturating_add(timing.frame_time_offset_ns);
+            // Capture to here: the transfer, the capture queue and the decoder — the one figure
+            // that tells the jpeg_codec choices apart on a running robot.
+            let age_ms = ros_now.saturating_sub(stamp_ns) as f64 / 1e6;
 
             let waited = Instant::now();
             let orientation = orientation_at(&imu, frame_time_ns, timing.max_imu_wait);
@@ -184,8 +188,8 @@ pub fn raw_frame_warper(
             match appsrc.push_buffer(out) {
                 Ok(_) => log_info!(
                     logger.throttle(STATS_THROTTLE),
-                    "[WarpBridge] warp {warp_ms:.1} ms, IMU wait {wait_ms:.1} ms \
-                     (stabilizing: {stabilizing})"
+                    "[WarpBridge] frame age at the warp {age_ms:.1} ms, warp {warp_ms:.1} ms, \
+                     IMU wait {wait_ms:.1} ms (stabilizing: {stabilizing})"
                 ),
                 Err(err) => log_warn!(
                     logger.throttle(LOG_THROTTLE),

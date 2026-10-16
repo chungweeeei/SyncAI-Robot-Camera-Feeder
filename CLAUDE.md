@@ -91,9 +91,10 @@ container whose device is missing).
 New logic that can be expressed over plain Rust types goes in a pure module with unit tests.
 
 **Stabilization (`stabilize: true`)** is gyro-based EIS: the capture pipeline is rate-limited to
-`ros_framerate`, decodes to I420 and ends in a raw appsink; the warp maps each frame into a
-low-passed "virtual camera" using the IMU orientation at the frame's capture time; an output
-pipeline (`appsrc ! jpegenc ! tee`) carries the usual two branches, both now at `ros_framerate`.
+`ros_framerate`, decodes to system-memory I420 and ends in a raw appsink; the warp maps each
+frame into a low-passed "virtual camera" using the IMU orientation at the frame's capture time; an
+output pipeline (`appsrc ! <encoder> ! tee`) carries the usual two branches, both now at
+`ros_framerate`. The decoder and encoder are the `jpeg_codec`'s (see "Hardware JPEG" below).
 `pipeline.rs` renders both descriptions (`build_stabilized_pipelines`) from the same branch
 helpers as the passthrough string, which stays byte-for-byte what it was when `stabilize` is off.
 The capture stamp is computed on the capture pipeline and handed to the output appsink in a
@@ -124,13 +125,41 @@ another process, `not-negotiated`, camera unplugged) ends the process with code 
 file's `respawn=True` restarts it 2 s later. Do not add in-process pipeline rebuilding: a fresh
 process is the one restart that is certain to have released the V4L2 device.
 
-**No hardware acceleration, on purpose.** The passthrough pipeline neither decodes nor encodes —
-JPEG bytes go from the camera to both branches untouched — so there is nothing for NVJPG/NVENC to
-do. The stabilized path does decode and re-encode, with plugins-good `jpegdec` / `jpegenc` on the
-CPU (roughly 15 ms per 720p frame on an Orin, which is why it runs at `ros_framerate`, not 60).
-Keeping Tegra elements out means the robot container needs no nvidia runtime for this node and
-the Dev Container runs the whole pipeline, stabilized or not. Transcoding for WebRTC stays in the
-worker.
+**Hardware JPEG on the stabilized path only.** The passthrough pipeline neither decodes nor
+encodes — JPEG bytes go from the camera to both branches untouched — so there is nothing to
+accelerate. The stabilized path decodes and re-encodes, and `jpeg_codec` picks who does it:
+`auto` (the default) asks the GStreamer registry at startup for the L4T chain
+(`NVIDIA_CODEC_ELEMENTS` in `pipeline.rs`: `identity drop-buffer-flags=corrupted !
+nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=I420` and `nvjpegenc`) and falls back to
+plugins-good `jpegdec` / `jpegenc` without it; `nvidia` refuses to start without it; `software`
+never uses it. The L4T plugins are not in any image: the nvidia container runtime bind-mounts them
+from the host, which is why the Workspace's robot container runs `runtime: nvidia` with
+`NVIDIA_DRIVER_CAPABILITIES`, and why the Dev Container (no nvidia runtime) always runs the
+software chain. Measured in robot01 (AGX Orin, JetPack 6 / R36.4, the real camera, a 200 Hz IMU,
+release build) at `ros_framerate` 30: the node fell from ~2.5 to ~1.9 cores (the encoder thread
+from ~28% to ~0; the rest is the rayon warp, which dominates), a frame's age at the warp from ~34
+to ~23 ms and at a ROS subscriber from ~53 to ~35 ms, both at 30.0 Hz; the encoded image is the
+same (both at quality 85). 60 fps stabilized was not pursued: there the hardware codec saved
+nothing measurable (~3.2–3.3 cores either way). Four things the chain depends on:
+
+- **`identity drop-buffer-flags=corrupted` before `nvv4l2decoder`.** The camera starts every
+  stream with four 0-byte buffers flagged CORRUPTED (PTS 0). `nvv4l2decoder` fed one fails with
+  "Failed to process frame" — a bus error, so a respawn — on about half the starts. Never drop it.
+- **No `jpegparse`, anywhere.** It also gets past those buffers, but the 1.20 one discards the
+  capture PTS and interpolates from the caps' framerate, seeded by the first (empty, PTS 0)
+  buffer. Every capture stamp then ran late by the time to the first real frame (~145 ms) plus
+  one frame period per frame dropped upstream — and the warp looked up the wrong IMU instant.
+  Nothing errors; only the "frame age at the warp" stats line shows it. A unit test guards it.
+- **The copy out of NVMM stays.** The warp reads the frame through `VideoFrameRef`, which needs
+  system memory; NVMM would need the NvBufSurface C API (unsafe FFI, forbidden here). That
+  `nvvidconv` copy (~2.5 ms) is most of what the hardware decode still costs. `nvjpegenc` takes
+  system memory directly; an `nvvidconv` to NVMM in front of it was slower.
+- **`nvjpegdec` is not the decoder.** It cannot emit system memory for a 4:2:2 JPEG (this
+  camera's), and through NVMM it was no faster than `jpegdec`.
+
+The first frame after a start is ~370 ms old at the warp while the decoder initialises; it is
+steady from the next stats line on. The warp itself stays on the CPU (rayon); the GPU path for it
+would be VPI, which is not a GStreamer element. Transcoding for WebRTC stays in the worker.
 
 ## GStreamer version pin
 
