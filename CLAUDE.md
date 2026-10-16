@@ -81,6 +81,7 @@ container whose device is missing).
 | `parameters.rs` | The load-time (read-only) parameters, validated into `Config`; the validators are unit-tested |
 | `pipeline.rs` | **Pure** pipeline description and `extra-controls` string; unit-tested |
 | `stamp.rs` | **Pure** capture-stamp math (node clock now − frame age on the pipeline clock); unit-tested |
+| `camera_info.rs` | **Pure** parser / validator of `camera_calibration`'s `ost.yaml` for `camera_info`; rejects rather than publishes a wrong calibration (another resolution, short matrices, unknown model); unit-tested |
 | `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
 | `math.rs` | **Pure** `Quat` / `Mat3` (no nalgebra: nothing current builds on rustc 1.85); unit-tested |
 | `imu.rs` | **Pure** Mahony filter and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |

@@ -1,4 +1,5 @@
 mod bus;
+mod camera_info;
 mod eis;
 mod imu;
 mod math;
@@ -19,7 +20,7 @@ use rclrs::*;
 // Aliased: `rclrs::*` also exports a `Time` (the clock reading), and the message type must not be
 // mistaken for it.
 use ros_env::builtin_interfaces::msg::Time as TimeMsg;
-use ros_env::sensor_msgs::msg::{CompressedImage, Imu};
+use ros_env::sensor_msgs::msg::{CameraInfo, CompressedImage, Imu};
 use ros_env::std_msgs::msg::Header;
 
 use bus::BusWatch;
@@ -36,6 +37,10 @@ const IMU_HISTORY: usize = 400;
 /// The sole opener of the camera: one capture pipeline whose MJPEG stream is teed to the WebRTC
 /// worker as RTP/JPEG and to ROS as `sensor_msgs/CompressedImage` on the relative topic
 /// `image_raw/compressed` (so `<robot_id>/image_raw/compressed`). See PROPOSAL.md.
+///
+/// With a `camera_info_file`, each image is followed by a `camera_info` carrying the same header,
+/// as `image_transport`'s camera publishers pair them. Only on the passthrough path: see
+/// `camera_info_publisher`.
 ///
 /// With `stabilize` on, the capture pipeline instead ends in a raw appsink, each decoded frame is
 /// warped by the IMU orientation at its capture time (`warp_bridge.rs`), and a second, output
@@ -74,6 +79,7 @@ impl CameraFeederNode {
         // subscriber: subscribe with SensorData QoS too.
         let publisher: Publisher<CompressedImage> =
             node.create_publisher("image_raw/compressed".keep_last(5).best_effort().volatile())?;
+        let camera_info = camera_info_publisher(&node, &config)?;
 
         let (pipeline, output_pipeline, imu_subscription) = match &config.stabilize {
             None => {
@@ -86,6 +92,7 @@ impl CameraFeederNode {
                     node.logger().clone(),
                     config.frame_id,
                     StampSource::PipelineClock,
+                    camera_info,
                 ));
                 (pipeline, None, None)
             }
@@ -116,6 +123,7 @@ impl CameraFeederNode {
                     node.logger().clone(),
                     config.frame_id,
                     StampSource::Table(Arc::clone(&stamps)),
+                    camera_info,
                 ));
 
                 let imu: SharedImu = Arc::new((
@@ -324,6 +332,79 @@ fn imu_subscription(
     )
 }
 
+/// The `camera_info` publisher and the message it repeats, with only the header changing.
+struct CameraInfoPublisher {
+    publisher: Publisher<CameraInfo>,
+    message: CameraInfo,
+}
+
+/// The `camera_info` publisher, or `None` (with the reason logged) when there is no calibration
+/// that describes the published image.
+///
+/// None of the failures stops the node: the camera still serves the WebRTC view and the image
+/// topic without a calibration, and an exit would only respawn into the same file.
+///
+/// With `stabilize` on there is none by design: every frame is warped by a rotation that changes
+/// per frame and magnified by `zoom`, so no fixed K and D describe the published image, and a
+/// consumer projecting points with the lens's would misplace them.
+fn camera_info_publisher(
+    node: &Node,
+    config: &parameters::Config,
+) -> Result<Option<CameraInfoPublisher>, RclrsError> {
+    let path = config.camera_info_file.as_str();
+    if path.is_empty() {
+        log_info!(
+            node.logger(),
+            "[CameraFeederNode] no camera_info_file; camera_info is not published"
+        );
+        return Ok(None);
+    }
+    if config.stabilize.is_some() {
+        log_warn!(
+            node.logger(),
+            "[CameraFeederNode] stabilize is on, so the published frames are warped and {path} \
+             does not describe them; camera_info is not published"
+        );
+        return Ok(None);
+    }
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|err| err.to_string())
+        .and_then(|text| camera_info::parse(&text, config.pipeline.width, config.pipeline.height));
+    let calibration = match parsed {
+        Ok(calibration) => calibration,
+        Err(err) => {
+            log_warn!(
+                node.logger(),
+                "[CameraFeederNode] {path}: {err}; camera_info is not published"
+            );
+            return Ok(None);
+        }
+    };
+    log_info!(
+        node.logger(),
+        "[CameraFeederNode] camera_info from {path}: {} fx {} fy {} cx {} cy {}",
+        calibration.distortion_model,
+        calibration.k[0],
+        calibration.k[4],
+        calibration.k[2],
+        calibration.k[5],
+    );
+
+    // The image topic's QoS, so whatever subscribes to the pair matches both.
+    let publisher = node.create_publisher("camera_info".keep_last(5).best_effort().volatile())?;
+    let message = CameraInfo {
+        width: calibration.width,
+        height: calibration.height,
+        distortion_model: calibration.distortion_model,
+        d: calibration.d,
+        k: calibration.k,
+        r: calibration.r,
+        p: calibration.p,
+        ..Default::default()
+    };
+    Ok(Some(CameraInfoPublisher { publisher, message }))
+}
+
 /// Where the ROS appsink's callback takes a frame's capture stamp from.
 enum StampSource {
     /// Computed here from the pipeline clock: the appsink is on the capture pipeline.
@@ -344,12 +425,15 @@ enum StampSource {
 /// to when it goes PLAYING. The closure must not capture the pipeline: the pipeline owns the
 /// appsink and the appsink owns this closure, so a captured pipeline would be a reference cycle
 /// that is never freed.
+///
+/// A `camera_info` goes out after each image with the same header, so the two pair by exact stamp.
 fn frame_publisher(
     publisher: Publisher<CompressedImage>,
     clock: Clock,
     logger: Logger,
     frame_id: String,
     stamp_source: StampSource,
+    camera_info: Option<CameraInfoPublisher>,
 ) -> gst_app::AppSinkCallbacks {
     gst_app::AppSinkCallbacks::builder()
         .new_sample(move |sink| {
@@ -389,12 +473,13 @@ fn frame_publisher(
                     }),
             };
             let (sec, nanosec) = stamp::to_sec_nanosec(stamp_ns);
+            let header = Header {
+                stamp: TimeMsg { sec, nanosec },
+                frame_id: frame_id.clone(),
+            };
 
             let message = CompressedImage {
-                header: Header {
-                    stamp: TimeMsg { sec, nanosec },
-                    frame_id: frame_id.clone(),
-                },
+                header: header.clone(),
                 format: "jpeg".to_string(),
                 data: map.as_slice().to_vec(),
             };
@@ -409,6 +494,18 @@ fn frame_publisher(
                     logger.throttle(Duration::from_secs(5)),
                     "[CameraFeederNode] publish failed, frame dropped: {err}",
                 ),
+            }
+            if let Some(info) = &camera_info {
+                let message = CameraInfo {
+                    header,
+                    ..info.message.clone()
+                };
+                if let Err(err) = info.publisher.publish(message) {
+                    log_warn!(
+                        logger.throttle(Duration::from_secs(5)),
+                        "[CameraFeederNode] camera_info publish failed: {err}",
+                    );
+                }
             }
             Ok(gst::FlowSuccess::Ok)
         })

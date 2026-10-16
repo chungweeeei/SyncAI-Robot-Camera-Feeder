@@ -46,6 +46,8 @@ pub struct Config {
     pub pipeline: PipelineConfig,
     /// The launch file prefixes it with `<robot_id>/`, since TF frame names are not namespaced.
     pub frame_id: String,
+    /// The camera_calibration YAML published on `camera_info`; empty publishes none.
+    pub camera_info_file: String,
     /// `Some` when `stabilize` is true.
     pub stabilize: Option<StabilizeConfig>,
 }
@@ -153,6 +155,11 @@ impl Parameters {
             "source_override",
             "",
             "replaces the v4l2src head of the pipeline when set; must produce image/jpeg",
+        )?;
+        let camera_info_file = text(
+            "camera_info_file",
+            "",
+            "camera_calibration YAML (ost.yaml) published on camera_info; empty = none",
         )?;
         let auto_exposure = integer(
             "auto_exposure",
@@ -348,6 +355,7 @@ impl Parameters {
                 },
             },
             frame_id: frame_id.get().to_string(),
+            camera_info_file: camera_info_file.get().to_string(),
             stabilize: stabilize_config,
         };
 
@@ -358,6 +366,7 @@ impl Parameters {
                     rtp_host,
                     frame_id,
                     source_override,
+                    camera_info_file,
                     imu_topic,
                     jpeg_codec,
                 ],

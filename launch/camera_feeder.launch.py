@@ -21,6 +21,7 @@ from launch_ros.actions import Node
 # the workspace inside the robot container, where docker-compose bind-mounts the per-robot instance
 # INI over config/system.ini.
 DEFAULT_SYSTEM_INI = os.path.expanduser("~/robot_ws/config/system.ini")
+DEFAULT_CALIBRATION_DIR = os.path.expanduser("~/robot_ws/config/calibration")
 FALLBACK_ROBOT_ID = "default_robot"
 
 logger = launch_logging.get_logger("camera_feeder.launch")
@@ -54,9 +55,17 @@ def launch_setup(context, *args, **kwargs):
 
     params_file = LaunchConfiguration("params_file")
 
+    # Per robot, beside the instance INI the robot_id came from: the calibration belongs to the
+    # camera mounted on that robot. The node publishes no camera_info (with a warning) when the
+    # file does not exist, so a robot that was never calibrated still streams.
+    camera_info_file = LaunchConfiguration("camera_info_file").perform(context) or os.path.join(
+        DEFAULT_CALIBRATION_DIR, robot_id, "camera0.yaml"
+    )
+
     # Later entries in this list take precedence over the params file.
     overrides = {
         "frame_id": f"{robot_id}/camera_optical_frame",
+        "camera_info_file": camera_info_file,
     }
 
     # No `name=`: the node is constructed as "syncai_camera_feeder", and the params file uses a
@@ -96,10 +105,18 @@ def generate_launch_description():
         description="Full path to the camera_feeder parameters YAML file",
     )
 
+    declare_camera_info_file = DeclareLaunchArgument(
+        "camera_info_file",
+        default_value="",
+        description="camera_calibration YAML for camera_info; empty = "
+        f"{DEFAULT_CALIBRATION_DIR}/<robot_id>/camera0.yaml",
+    )
+
     return LaunchDescription(
         [
             declare_system_config,
             declare_params_file,
+            declare_camera_info_file,
             OpaqueFunction(function=launch_setup),
         ]
     )

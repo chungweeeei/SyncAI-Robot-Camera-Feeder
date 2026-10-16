@@ -35,6 +35,7 @@ a pipeline error). Not yet run against the real camera on the robot.
 | Direction | Name | Type / format | Notes |
 |---|---|---|---|
 | Publish | `image_raw/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | 30 Hz (`ros_framerate`); SensorData QoS (best effort, keep last 5), as `vizionsdk_ros2` published it |
+| Publish | `camera_info` | `sensor_msgs/CameraInfo` | One per image, same header, same QoS; only with a valid `camera_info_file` and `stabilize` off |
 | Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | 60 Hz (`framerate`), for the WebRTC worker's `rtpjpeg` source |
 
 - **Nothing is decoded** (by default). The camera's JPEG bytes go to both branches untouched, each
@@ -50,6 +51,12 @@ a pipeline error). Not yet run against the real camera on the robot.
 - **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
   pipeline clock (`src/camera_feeder_node/stamp.rs`); with stabilization on, the stamp computed
   on the capture pipeline travels to the output pipeline's appsink keyed by PTS.
+- **`camera_info`** comes from the YAML `camera_calibration` writes (`ost.yaml`), read once at
+  start. The launch file looks for it at `~/robot_ws/config/calibration/<robot_id>/camera0.yaml`
+  (`camera_info_file:=` overrides it), since intrinsics belong to one physical camera. A missing
+  or malformed file, or one calibrated at another resolution, publishes no `camera_info` and
+  warns; so does `stabilize: true`, whose warped frames no fixed K describes. The images go on
+  in every case.
 - **ISP controls** (exposure, white balance, gain, flicker) are written once at capture start with
   the WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
 - **On any pipeline error the node exits** and the launch file respawns it.

@@ -657,6 +657,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -954,6 +960,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -999,6 +1011,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -1051,6 +1076,8 @@ dependencies = [
  "rayon",
  "rclrs",
  "ros-env 0.2.1",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -1194,6 +1221,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "uuid"
 version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1323,39 +1356,39 @@ dependencies = [
 
 [[patch.unused]]
 name = "action_msgs"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "actionlib_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "builtin_interfaces"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "composition_interfaces"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "diagnostic_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "geometry_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "lifecycle_msgs"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "nav_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "rcl_interfaces"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "rmw_dds_common"
@@ -1367,31 +1400,31 @@ version = "0.15.16"
 
 [[patch.unused]]
 name = "rosgraph_msgs"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "sensor_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "shape_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "statistics_msgs"
-version = "1.2.2"
+version = "1.2.3"
 
 [[patch.unused]]
 name = "std_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "std_srvs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "stereo_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "syncai_camera_feeder"
@@ -1399,11 +1432,11 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "tf2_msgs"
-version = "0.25.20"
+version = "0.25.22"
 
 [[patch.unused]]
 name = "trajectory_msgs"
-version = "4.9.1"
+version = "4.9.2"
 
 [[patch.unused]]
 name = "unique_identifier_msgs"
@@ -1411,4 +1444,4 @@ version = "2.2.1"
 
 [[patch.unused]]
 name = "visualization_msgs"
-version = "4.9.1"
+version = "4.9.2"
