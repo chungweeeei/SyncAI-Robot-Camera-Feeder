@@ -31,6 +31,14 @@
     # sampling RTP/JPEG (RFC 2435) cannot carry, and rtpjpegpay drops every frame with
     # "Invalid component".
     source_override: ""
+    # The camera's calibration, published on camera_info beside every image with the same header:
+    # the YAML camera_calibration writes (ost.yaml), as it comes out. Empty publishes no
+    # camera_info. The launch file sets it to the robot's own copy,
+    # ~/robot_ws/config/calibration/<robot_id>/camera0.yaml, because intrinsics belong to one
+    # physical camera, not to this package. A missing or malformed file, one calibrated at
+    # another resolution than width x height, or stabilize: true (the warped frames have no fixed
+    # K) publishes none, with a warning; the images go on either way.
+    camera_info_file: ""
 
     # Sensor (ISP) controls, written through v4l2src extra-controls at capture start. The values
     # are the WebRTC worker's, measured on this camera (see its internal/config/config.go). UVC

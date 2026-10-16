@@ -27,6 +27,10 @@ gstreamer-video = { version = "0.24", features = ["v1_20"] }
 # Row-parallel warp. nalgebra / an AHRS crate would have been the natural fit for the math, but
 # every release that still builds on rustc 1.85 is two major versions old; math.rs is ~150 lines.
 rayon = "1"
+# camera_info.rs reads camera_calibration's YAML (ost.yaml). serde_yaml is unmaintained upstream
+# but finished, and it builds on rustc 1.85.
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 # Install launch/ and params/ into share/syncai_camera_feeder/ so the launch file finds them
 [package.metadata.ros]
