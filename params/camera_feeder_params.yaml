@@ -19,8 +19,10 @@
     # RTP/JPEG to the WebRTC worker; must match the worker's VIDEO_RTP_IN_PORT.
     rtp_host: "127.0.0.1"
     rtp_port: 5008
-    # Rate of image_raw/compressed. A lower positive rate drops frames on the ROS branch only
-    # (videorate drop-only); the RTP branch stays at `framerate`. 0 publishes every captured frame.
+    # Rate of image_raw/compressed. A lower positive rate drops frames on the ROS branch only, by
+    # PTS, and the frames it keeps carry their own capture stamps (videorate, which did this until
+    # 2026-10-16, restamped them up to a capture period early); the RTP branch stays at
+    # `framerate`. 0 publishes every captured frame.
     ros_framerate: 30
     # Overridden by the launch file with <robot_id>/camera_optical_frame.
     frame_id: "camera_optical_frame"
@@ -95,6 +97,12 @@
     # offset). Half the exposure time is added automatically in manual exposure. Sweep it while
     # rocking the robot and keep the value with the least residual shake (the bag fit: +10 ms,
     # flat between +5 and +15).
+    #
+    # Suspect until re-swept: that bag's frames went through videorate, which stamped each one
+    # 0-16.7 ms early by an amount fixed for the recording and different on every start (see
+    # rate_limit.rs). The +10 ms may be mostly that recording's offset rather than a latency; with
+    # the stamps now the capture's own it is probably too large. Fit it again on a bag recorded
+    # after 2026-10-16.
     imu_time_offset_ms: 10.0
     # Time constant (s) of the low-pass the virtual camera follows the real one with. Larger is
     # steadier and lags further behind real pans.

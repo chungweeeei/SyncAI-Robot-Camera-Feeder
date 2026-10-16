@@ -11,6 +11,10 @@ pub const ROS_SINK_NAME: &str = "ros";
 pub const RAW_SINK_NAME: &str = "raw";
 /// The appsrc at the head of the stabilized output pipeline, where the warped frames go in.
 pub const WARPED_SRC_NAME: &str = "warped";
+/// The `identity` the rate limit down to `ros_framerate` hangs on: the node adds a buffer probe to
+/// its sink pad that drops frames by PTS (`rate_limit.rs`). Present only when
+/// [`is_rate_limited`].
+pub const RATE_LIMIT_NAME: &str = "rate_limit";
 
 /// The two descriptions of the stabilized path. `capture` ends in the raw appsink and `output`
 /// starts at the appsrc the warp feeds; the Rust warp (`warp_bridge.rs`) is the bridge between
@@ -66,8 +70,7 @@ pub enum JpegCodecChoice {
     Nvidia,
 }
 
-/// The L4T factories the NVIDIA chain is built from, in chain order. Its `identity` is core and
-/// always there.
+/// The L4T factories the NVIDIA chain is built from, in chain order.
 pub const NVIDIA_CODEC_ELEMENTS: [&str; 3] = ["nvv4l2decoder", "nvvidconv", "nvjpegenc"];
 
 /// The elements of [`NVIDIA_CODEC_ELEMENTS`] that `is_registered` says are missing, in chain
@@ -174,7 +177,7 @@ pub struct PipelineConfig {
     pub rtp_host: String,
     pub rtp_port: u16,
     /// Rate of the ROS branch. At or above `framerate` the branch carries every frame and has no
-    /// `videorate` at all.
+    /// rate limit at all.
     pub ros_framerate: u32,
     /// Replaces the whole capture head (`v4l2src ! image/jpeg,…`) when non-empty. For machines
     /// without the camera; it must produce `image/jpeg` that `rtpjpegpay` accepts (4:2:0 or 4:2:2,
@@ -218,11 +221,28 @@ pub fn sensor_controls(controls: &SensorControls) -> String {
 const LEAKY_QUEUE: &str =
     "queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream";
 
+/// Drops the buffers the camera's driver flagged broken, before anything else sees them.
+///
+/// This camera starts most streams with four 0-byte buffers, flagged CORRUPTED (the UVC driver's
+/// frame-error flag) and stamped PTS 0: on 4 of 5 starts on robot01, and about half in earlier
+/// counts. Let through, each consumer met them differently:
+///
+/// - the ROS branch published them as empty `CompressedImage`s (the log said "first frame
+///   published (0 bytes)"), which a subscriber that decodes them fails on;
+/// - `rtpjpegpay` rejected them with an "Unsupported JPEG" bus WARNING;
+/// - `nvv4l2decoder` failed with "Failed to process frame" — a bus error, so an exit and a
+///   respawn — on 4 of 8 starts. Dropped by their flag, 0 of 20 starts failed.
+///
+/// A frame the driver marks broken mid-stream (a truncated JPEG) goes the same way, on both
+/// branches. One element at the head rather than one per consumer, so a branch added later cannot
+/// forget it; it used to sit in front of `nvv4l2decoder` alone.
+const DROP_CORRUPTED: &str = "identity drop-buffer-flags=corrupted";
+
 /// Builds the description handed to `gst::parse::launch`.
 ///
 /// ```text
-/// v4l2src ! image/jpeg ! tee ─┬─ queue ! rtpjpegpay ! udpsink      → WebRTC worker
-///                             └─ queue [! videorate] ! appsink     → image_raw/compressed
+/// v4l2src ! image/jpeg ! identity ! tee ─┬─ queue ! rtpjpegpay ! udpsink       → WebRTC worker
+///                                        └─ queue [! rate_limit] ! appsink     → image_raw/compressed
 /// ```
 ///
 /// Nothing is decoded: the camera's JPEG bytes go to both branches untouched.
@@ -235,7 +255,7 @@ const LEAKY_QUEUE: &str =
 /// time only adds latency.
 #[must_use]
 pub fn build_pipeline_string(config: &PipelineConfig) -> String {
-    let source = capture_head(config);
+    let source = source(config);
     let rtp_branch = rtp_branch(config);
     let rate_limit = rate_limit(config);
     let ros_branch = format!("t. ! {LEAKY_QUEUE}{rate_limit} ! {}", ros_appsink());
@@ -246,8 +266,8 @@ pub fn build_pipeline_string(config: &PipelineConfig) -> String {
 /// The two descriptions of the stabilized path (`stabilize: true`).
 ///
 /// ```text
-/// capture: v4l2src ! image/jpeg [! videorate] ! queue ! <decoder> ! I420 ! appsink name=raw
-///                                                        │ Rust: warp by the IMU orientation
+/// capture: v4l2src ! image/jpeg ! identity [! rate_limit] ! queue ! <decoder> ! I420 ! appsink name=raw
+///                                                                    │ Rust: warp by the IMU orientation
 /// output:  appsrc name=warped ! <encoder> ! tee ─┬─ queue ! rtpjpegpay ! udpsink
 ///                                                └─ queue ! appsink name=ros
 /// ```
@@ -272,7 +292,7 @@ pub fn build_stabilized_pipelines(
     let capture = format!(
         "{}{} ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {} ! appsink name={RAW_SINK_NAME} sync=false max-buffers=1 drop=true",
-        capture_head(config),
+        source(config),
         rate_limit(config),
         decoder(codec),
     );
@@ -303,11 +323,9 @@ pub fn build_stabilized_pipelines(
 /// NvBufSurface C API, i.e. unsafe FFI, which this crate forbids. The full range survives: the
 /// decoder tags it and the copy keeps 0–255.
 ///
-/// The `identity` in front of `nvv4l2decoder` is load-bearing. This camera starts every stream
-/// with four 0-byte buffers, flagged CORRUPTED and stamped PTS 0. `jpegdec` shrugs them off;
-/// `nvv4l2decoder` fed one fails with "Failed to process frame" — a bus error, so an exit and a
-/// respawn — and did on 4 of 8 starts. Dropped by their flag, 0 of 20 starts failed, and a frame
-/// the UVC driver marks broken mid-stream goes the same way.
+/// `nvv4l2decoder` must never see the camera's empty start-of-stream buffers, which fail it on
+/// about half the starts; [`DROP_CORRUPTED`] at the head of the capture pipeline removes them
+/// before the decoder. `jpegdec` shrugs them off.
 ///
 /// `jpegparse` also gets past the empty buffers, and must not be used for it: in 1.20 it discards
 /// the upstream PTS and interpolates from the caps' framerate, seeded by the first buffer it sees
@@ -318,10 +336,7 @@ pub fn build_stabilized_pipelines(
 fn decoder(codec: JpegCodec) -> &'static str {
     match codec {
         JpegCodec::Software => "jpegdec ! video/x-raw,format=I420",
-        JpegCodec::Nvidia => {
-            "identity drop-buffer-flags=corrupted ! nvv4l2decoder mjpeg=1 ! nvvidconv \
-             ! video/x-raw,format=I420"
-        }
+        JpegCodec::Nvidia => "nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=I420",
     }
 }
 
@@ -353,6 +368,12 @@ fn capture_head(config: &PipelineConfig) -> String {
     }
 }
 
+/// The capture head followed by [`DROP_CORRUPTED`]: where every pipeline that takes frames from
+/// the camera, or from its stand-in, starts.
+fn source(config: &PipelineConfig) -> String {
+    format!("{} ! {DROP_CORRUPTED}", capture_head(config))
+}
+
 fn rtp_branch(config: &PipelineConfig) -> String {
     format!(
         "t. ! {LEAKY_QUEUE} ! rtpjpegpay pt=26 \
@@ -361,15 +382,24 @@ fn rtp_branch(config: &PipelineConfig) -> String {
     )
 }
 
-/// ` ! videorate …` down to `ros_framerate`, or nothing when every frame is carried.
+/// Whether frames are dropped down to `ros_framerate`: on the ROS branch, or on the whole
+/// stabilized path.
+#[must_use]
+pub fn is_rate_limited(config: &PipelineConfig) -> bool {
+    config.ros_framerate < config.framerate
+}
+
+/// ` ! identity name=rate_limit` when [`is_rate_limited`], or nothing when every frame is carried.
 ///
-/// drop-only: videorate may only drop frames to reach the lower rate, never duplicate one.
+/// The element itself passes everything; the node's probe on it does the dropping. It is not
+/// `videorate drop-only=true`, which keeps the right frames but restamps each one onto its own
+/// output grid — up to a capture period early, by an amount that changes with every start — and
+/// so broke the capture stamps (`rate_limit.rs` has the measurement). No capsfilter follows it
+/// either: the caps keep the capture `framerate`, because a lower one there would be negotiated
+/// back to `v4l2src`, which the sensor does not offer.
 fn rate_limit(config: &PipelineConfig) -> String {
-    if config.ros_framerate < config.framerate {
-        format!(
-            " ! videorate drop-only=true ! image/jpeg,framerate={}/1",
-            config.ros_framerate
-        )
+    if is_rate_limited(config) {
+        format!(" ! identity name={RATE_LIMIT_NAME}")
     } else {
         String::new()
     }
@@ -463,7 +493,10 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("! image/jpeg,width=1280,height=720,framerate=60/1 ! tee name=t"),
+            out.contains(
+                "! image/jpeg,width=1280,height=720,framerate=60/1 \
+                 ! identity drop-buffer-flags=corrupted ! tee name=t"
+            ),
             "{out}"
         );
         assert!(
@@ -485,22 +518,44 @@ mod tests {
     }
 
     #[test]
-    fn full_rate_ros_branch_has_no_videorate() {
+    fn full_rate_ros_branch_has_no_rate_limit() {
         let out = build_pipeline_string(&config());
-        assert!(!out.contains("videorate"), "{out}");
+        assert!(!is_rate_limited(&config()));
+        assert!(!out.contains(RATE_LIMIT_NAME), "{out}");
     }
 
     #[test]
-    fn lower_ros_rate_inserts_videorate_on_the_ros_branch_only() {
-        let out = build_pipeline_string(&PipelineConfig {
+    fn lower_ros_rate_hangs_the_rate_limit_on_the_ros_branch_only() {
+        let config = PipelineConfig {
             ros_framerate: 30,
             ..config()
-        });
+        };
+        assert!(is_rate_limited(&config));
+        let out = build_pipeline_string(&config);
         let ros_branch = out.rfind("t. !").unwrap();
-        let videorate = out
-            .find("videorate drop-only=true ! image/jpeg,framerate=30/1")
+        let rate_limit = out
+            .find(&format!(
+                "! identity name={RATE_LIMIT_NAME} ! appsink name={ROS_SINK_NAME}"
+            ))
             .unwrap();
-        assert!(videorate > ros_branch, "{out}");
+        assert!(rate_limit > ros_branch, "{out}");
+        assert_eq!(out.matches(RATE_LIMIT_NAME).count(), 1, "{out}");
+        // The caps keep the capture rate: a lower one would be negotiated back to v4l2src.
+        assert!(!out.contains("framerate=30/1"), "{out}");
+    }
+
+    #[test]
+    fn no_chain_has_a_videorate() {
+        // videorate (1.20) restamps every frame it keeps onto its own output grid, which shifted
+        // every capture stamp by up to a capture period; see rate_limit().
+        let passthrough = build_pipeline_string(&stabilized_config());
+        assert!(!passthrough.contains("videorate"), "{passthrough}");
+        for codec in [JpegCodec::Software, JpegCodec::Nvidia] {
+            let StabilizedPipelines { capture, output } =
+                build_stabilized_pipelines(&stabilized_config(), codec);
+            assert!(!capture.contains("videorate"), "{capture}");
+            assert!(!output.contains("videorate"), "{output}");
+        }
     }
 
     #[test]
@@ -510,7 +565,10 @@ mod tests {
             ..config()
         });
         assert!(
-            out.starts_with("videotestsrc is-live=true ! jpegenc ! tee name=t"),
+            out.starts_with(
+                "videotestsrc is-live=true ! jpegenc ! identity drop-buffer-flags=corrupted \
+                 ! tee name=t"
+            ),
             "{out}"
         );
         assert!(!out.contains("v4l2src"), "{out}");
@@ -532,12 +590,12 @@ mod tests {
             capture.starts_with("v4l2src device=\"/dev/syncai/camera0\" io-mode=2"),
             "{capture}"
         );
-        let videorate = capture
-            .find("videorate drop-only=true ! image/jpeg,framerate=30/1")
+        let rate_limit = capture
+            .find(&format!("identity name={RATE_LIMIT_NAME}"))
             .unwrap();
         let queue = capture.find("queue max-size-buffers=2").unwrap();
         let decoder = capture.find("jpegdec ! video/x-raw,format=I420").unwrap();
-        assert!(videorate < queue && queue < decoder, "{capture}");
+        assert!(rate_limit < queue && queue < decoder, "{capture}");
         assert_eq!(capture.matches("leaky=downstream").count(), 1, "{capture}");
         assert!(
             capture.ends_with(&format!(
@@ -577,14 +635,14 @@ mod tests {
         );
         assert_eq!(output.matches("leaky=downstream").count(), 2, "{output}");
         // The whole path already runs at ros_framerate; no second rate limit.
-        assert!(!output.contains("videorate"), "{output}");
+        assert!(!output.contains(RATE_LIMIT_NAME), "{output}");
     }
 
     #[test]
     fn stabilized_at_full_rate_decodes_every_frame() {
         let StabilizedPipelines { capture, output } =
             build_stabilized_pipelines(&config(), JpegCodec::Software);
-        assert!(!capture.contains("videorate"), "{capture}");
+        assert!(!capture.contains(RATE_LIMIT_NAME), "{capture}");
         assert!(output.contains("framerate=60/1"), "{output}");
     }
 
@@ -598,7 +656,10 @@ mod tests {
             JpegCodec::Software,
         );
         assert!(
-            capture.starts_with("videotestsrc is-live=true ! jpegenc ! videorate"),
+            capture.starts_with(
+                "videotestsrc is-live=true ! jpegenc ! identity drop-buffer-flags=corrupted \
+                 ! identity name=rate_limit"
+            ),
             "{capture}"
         );
         assert!(!capture.contains("v4l2src"), "{capture}");
@@ -617,15 +678,44 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_capture_drops_corrupted_buffers_before_the_decoder_and_copies_out_i420() {
+    fn every_pipeline_drops_corrupted_buffers_once_at_the_head() {
+        // Before the tee, so neither branch sees the camera's empty start-of-stream buffers; see
+        // DROP_CORRUPTED.
+        for config in [
+            config(),
+            PipelineConfig {
+                source_override: "videotestsrc is-live=true ! jpegenc".to_string(),
+                ..config()
+            },
+        ] {
+            let out = build_pipeline_string(&config);
+            assert_eq!(out.matches(DROP_CORRUPTED).count(), 1, "{out}");
+            assert!(
+                out.find(DROP_CORRUPTED).unwrap() < out.find("tee name=t").unwrap(),
+                "{out}"
+            );
+        }
+        // Before the decoder, which on the NVIDIA chain fails on them.
+        for codec in [JpegCodec::Software, JpegCodec::Nvidia] {
+            let StabilizedPipelines { capture, output } =
+                build_stabilized_pipelines(&stabilized_config(), codec);
+            assert_eq!(capture.matches(DROP_CORRUPTED).count(), 1, "{capture}");
+            assert!(
+                capture.find(DROP_CORRUPTED).unwrap() < capture.find(decoder(codec)).unwrap(),
+                "{capture}"
+            );
+            // The output pipeline is fed by the warp, which only ever pushes decoded frames.
+            assert!(!output.contains(DROP_CORRUPTED), "{output}");
+        }
+    }
+
+    #[test]
+    fn nvidia_capture_decodes_behind_the_queue_and_copies_out_i420() {
         let StabilizedPipelines { capture, .. } =
             build_stabilized_pipelines(&stabilized_config(), JpegCodec::Nvidia);
         let queue = capture.find("queue max-size-buffers=2").unwrap();
         let chain = capture
-            .find(
-                "identity drop-buffer-flags=corrupted ! nvv4l2decoder mjpeg=1 ! nvvidconv \
-                 ! video/x-raw,format=I420 ! appsink",
-            )
+            .find("nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=I420 ! appsink")
             .unwrap();
         assert!(queue < chain, "{capture}");
         // System memory: no (memory:NVMM) on the caps the warp maps.
