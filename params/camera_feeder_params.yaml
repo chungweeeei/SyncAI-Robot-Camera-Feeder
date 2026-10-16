@@ -31,8 +31,9 @@
     # sampling RTP/JPEG (RFC 2435) cannot carry, and rtpjpegpay drops every frame with
     # "Invalid component".
     source_override: ""
-    # The camera's calibration, published on camera_info beside every image with the same header:
-    # the YAML camera_calibration writes (ost.yaml), as it comes out. Empty publishes no
+    # The camera's calibration, published once on camera_info at start and latched (reliable,
+    # transient local; subscribe transient local to get it after the fact): the YAML
+    # camera_calibration writes (ost.yaml), as it comes out. Empty publishes no
     # camera_info. The launch file sets it to the robot's own copy,
     # ~/robot_ws/config/calibration/<robot_id>/camera0.yaml, because intrinsics belong to one
     # physical camera, not to this package. A missing or malformed file, one calibrated at
