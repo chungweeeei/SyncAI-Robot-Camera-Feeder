@@ -130,8 +130,8 @@ process is the one restart that is certain to have released the V4L2 device.
 encodes — JPEG bytes go from the camera to both branches untouched — so there is nothing to
 accelerate. The stabilized path decodes and re-encodes, and `jpeg_codec` picks who does it:
 `auto` (the default) asks the GStreamer registry at startup for the L4T chain
-(`NVIDIA_CODEC_ELEMENTS` in `pipeline.rs`: `identity drop-buffer-flags=corrupted !
-nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=I420` and `nvjpegenc`) and falls back to
+(`NVIDIA_CODEC_ELEMENTS` in `pipeline.rs`: `nvv4l2decoder mjpeg=1 ! nvvidconv !
+video/x-raw,format=I420` and `nvjpegenc`) and falls back to
 plugins-good `jpegdec` / `jpegenc` without it; `nvidia` refuses to start without it; `software`
 never uses it. The L4T plugins are not in any image: the nvidia container runtime bind-mounts them
 from the host, which is why the Workspace's robot container runs `runtime: nvidia` with
@@ -143,9 +143,12 @@ to ~23 ms and at a ROS subscriber from ~53 to ~35 ms, both at 30.0 Hz; the encod
 same (both at quality 85). 60 fps stabilized was not pursued: there the hardware codec saved
 nothing measurable (~3.2–3.3 cores either way). Four things the chain depends on:
 
-- **`identity drop-buffer-flags=corrupted` before `nvv4l2decoder`.** The camera starts every
-  stream with four 0-byte buffers flagged CORRUPTED (PTS 0). `nvv4l2decoder` fed one fails with
-  "Failed to process frame" — a bus error, so a respawn — on about half the starts. Never drop it.
+- **`identity drop-buffer-flags=corrupted` at the head of every pipeline.** The camera starts most
+  streams with four 0-byte buffers flagged CORRUPTED (PTS 0). `nvv4l2decoder` fed one fails with
+  "Failed to process frame" — a bus error, so a respawn — on about half the starts; on the
+  passthrough path they went out as empty `CompressedImage`s and as an `rtpjpegpay` "Unsupported
+  JPEG" warning. It used to sit in front of `nvv4l2decoder` only; it is the first element after
+  the capture head now (`DROP_CORRUPTED` in `pipeline.rs`), in both modes. Never drop it.
 - **No `jpegparse`, anywhere.** It also gets past those buffers, but the 1.20 one discards the
   capture PTS and interpolates from the caps' framerate, seeded by the first (empty, PTS 0)
   buffer. Every capture stamp then ran late by the time to the first real frame (~145 ms) plus
