@@ -38,9 +38,9 @@ const IMU_HISTORY: usize = 400;
 /// worker as RTP/JPEG and to ROS as `sensor_msgs/CompressedImage` on the relative topic
 /// `image_raw/compressed` (so `<robot_id>/image_raw/compressed`). See PROPOSAL.md.
 ///
-/// With a `camera_info_file`, each image is followed by a `camera_info` carrying the same header,
-/// as `image_transport`'s camera publishers pair them. Only on the passthrough path: see
-/// `camera_info_publisher`.
+/// With a `camera_info_file`, the calibration is published once on `camera_info`, latched
+/// (reliable + transient local), rather than beside every image: it never changes while the node
+/// runs. Only on the passthrough path: see `camera_info_publisher`.
 ///
 /// With `stabilize` on, the capture pipeline instead ends in a raw appsink, each decoded frame is
 /// warped by the IMU orientation at its capture time (`warp_bridge.rs`), and a second, output
@@ -62,6 +62,9 @@ pub struct CameraFeederNode {
     // the bus watchers are joined before the last pipeline references and the node go away.
     _bus_watches: Vec<BusWatch>,
     _imu_subscription: Option<Subscription<Imu>>,
+    /// Held, never published to again: the latched sample lives in this writer, so dropping it
+    /// would take the calibration away from every subscriber that joins later.
+    _camera_info: Option<Publisher<CameraInfo>>,
     /// The capture pipeline: the one that opens the camera.
     pipeline: gst::Pipeline,
     /// The stabilized path's output pipeline (`appsrc ! jpegenc|nvjpegenc ! tee …`).
@@ -92,7 +95,6 @@ impl CameraFeederNode {
                     node.logger().clone(),
                     config.frame_id,
                     StampSource::PipelineClock,
-                    camera_info,
                 ));
                 (pipeline, None, None)
             }
@@ -123,7 +125,6 @@ impl CameraFeederNode {
                     node.logger().clone(),
                     config.frame_id,
                     StampSource::Table(Arc::clone(&stamps)),
-                    camera_info,
                 ));
 
                 let imu: SharedImu = Arc::new((
@@ -199,6 +200,7 @@ impl CameraFeederNode {
         Ok(Self {
             _bus_watches: bus_watches,
             _imu_subscription: imu_subscription,
+            _camera_info: camera_info,
             pipeline,
             output_pipeline,
             _parameters: parameters,
@@ -332,14 +334,14 @@ fn imu_subscription(
     )
 }
 
-/// The `camera_info` publisher and the message it repeats, with only the header changing.
-struct CameraInfoPublisher {
-    publisher: Publisher<CameraInfo>,
-    message: CameraInfo,
-}
-
-/// The `camera_info` publisher, or `None` (with the reason logged) when there is no calibration
-/// that describes the published image.
+/// Publishes the calibration once, latched, and returns the publisher that holds it; `None` (with
+/// the reason logged) when there is no calibration that describes the published image.
+///
+/// Latched rather than beside every frame, because the calibration is fixed for the node's life.
+/// The cost is on the subscriber side: only a TRANSIENT_LOCAL subscriber gets the sample after it
+/// went out (a volatile one matches and receives nothing, so it looks like a missing calibration),
+/// and nothing pairs an image with it by stamp — the header stamp is the node's start. A bag
+/// replay delivers it only with a QoS override marking the topic transient local.
 ///
 /// None of the failures stops the node: the camera still serves the WebRTC view and the image
 /// topic without a calibration, and an exit would only respawn into the same file.
@@ -350,7 +352,7 @@ struct CameraInfoPublisher {
 fn camera_info_publisher(
     node: &Node,
     config: &parameters::Config,
-) -> Result<Option<CameraInfoPublisher>, RclrsError> {
+) -> Result<Option<Publisher<CameraInfo>>, RclrsError> {
     let path = config.camera_info_file.as_str();
     if path.is_empty() {
         log_info!(
@@ -390,9 +392,16 @@ fn camera_info_publisher(
         calibration.k[5],
     );
 
-    // The image topic's QoS, so whatever subscribes to the pair matches both.
-    let publisher = node.create_publisher("camera_info".keep_last(5).best_effort().volatile())?;
+    // Reliable as well as transient local: DDS hands the stored sample to a late joiner only over
+    // a reliable connection. Depth 1 because there is only ever the one sample.
+    let publisher: Publisher<CameraInfo> =
+        node.create_publisher("camera_info".keep_last(1).reliable().transient_local())?;
+    let (sec, nanosec) = stamp::to_sec_nanosec(node.get_clock().now().nsec);
     let message = CameraInfo {
+        header: Header {
+            stamp: TimeMsg { sec, nanosec },
+            frame_id: config.frame_id.clone(),
+        },
         width: calibration.width,
         height: calibration.height,
         distortion_model: calibration.distortion_model,
@@ -402,7 +411,15 @@ fn camera_info_publisher(
         p: calibration.p,
         ..Default::default()
     };
-    Ok(Some(CameraInfoPublisher { publisher, message }))
+    if let Err(err) = publisher.publish(message) {
+        // Nothing would ever retry it, so a failure here means no calibration for this run.
+        log_warn!(
+            node.logger(),
+            "[CameraFeederNode] camera_info publish failed: {err}; camera_info is not published"
+        );
+        return Ok(None);
+    }
+    Ok(Some(publisher))
 }
 
 /// Where the ROS appsink's callback takes a frame's capture stamp from.
@@ -425,15 +442,12 @@ enum StampSource {
 /// to when it goes PLAYING. The closure must not capture the pipeline: the pipeline owns the
 /// appsink and the appsink owns this closure, so a captured pipeline would be a reference cycle
 /// that is never freed.
-///
-/// A `camera_info` goes out after each image with the same header, so the two pair by exact stamp.
 fn frame_publisher(
     publisher: Publisher<CompressedImage>,
     clock: Clock,
     logger: Logger,
     frame_id: String,
     stamp_source: StampSource,
-    camera_info: Option<CameraInfoPublisher>,
 ) -> gst_app::AppSinkCallbacks {
     gst_app::AppSinkCallbacks::builder()
         .new_sample(move |sink| {
@@ -473,13 +487,12 @@ fn frame_publisher(
                     }),
             };
             let (sec, nanosec) = stamp::to_sec_nanosec(stamp_ns);
-            let header = Header {
-                stamp: TimeMsg { sec, nanosec },
-                frame_id: frame_id.clone(),
-            };
 
             let message = CompressedImage {
-                header: header.clone(),
+                header: Header {
+                    stamp: TimeMsg { sec, nanosec },
+                    frame_id: frame_id.clone(),
+                },
                 format: "jpeg".to_string(),
                 data: map.as_slice().to_vec(),
             };
@@ -494,18 +507,6 @@ fn frame_publisher(
                     logger.throttle(Duration::from_secs(5)),
                     "[CameraFeederNode] publish failed, frame dropped: {err}",
                 ),
-            }
-            if let Some(info) = &camera_info {
-                let message = CameraInfo {
-                    header,
-                    ..info.message.clone()
-                };
-                if let Err(err) = info.publisher.publish(message) {
-                    log_warn!(
-                        logger.throttle(Duration::from_secs(5)),
-                        "[CameraFeederNode] camera_info publish failed: {err}",
-                    );
-                }
             }
             Ok(gst::FlowSuccess::Ok)
         })

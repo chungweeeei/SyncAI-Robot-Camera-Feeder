@@ -35,7 +35,7 @@ a pipeline error). Not yet run against the real camera on the robot.
 | Direction | Name | Type / format | Notes |
 |---|---|---|---|
 | Publish | `image_raw/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | 30 Hz (`ros_framerate`); SensorData QoS (best effort, keep last 5), as `vizionsdk_ros2` published it |
-| Publish | `camera_info` | `sensor_msgs/CameraInfo` | One per image, same header, same QoS; only with a valid `camera_info_file` and `stabilize` off |
+| Publish | `camera_info` | `sensor_msgs/CameraInfo` | Once at start, latched (reliable, transient local, depth 1); only with a valid `camera_info_file` and `stabilize` off |
 | Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | 60 Hz (`framerate`), for the WebRTC worker's `rtpjpeg` source |
 
 - **Nothing is decoded** (by default). The camera's JPEG bytes go to both branches untouched, each
@@ -56,7 +56,11 @@ a pipeline error). Not yet run against the real camera on the robot.
   (`camera_info_file:=` overrides it), since intrinsics belong to one physical camera. A missing
   or malformed file, or one calibrated at another resolution, publishes no `camera_info` and
   warns; so does `stabilize: true`, whose warped frames no fixed K describes. The images go on
-  in every case.
+  in every case. It is **published once and latched**, not beside every frame: subscribe with
+  `TRANSIENT_LOCAL` durability (a volatile subscriber that joins later receives nothing), and do
+  not pair it with images by stamp — its stamp is the node's start. `ros2 bag record` picks the
+  durability up from the publisher; `ros2 bag play` on Humble needs a QoS override marking the
+  topic transient local for late joiners to get it.
 - **ISP controls** (exposure, white balance, gain, flicker) are written once at capture start with
   the WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
 - **On any pipeline error the node exits** and the launch file respawns it.
