@@ -5,6 +5,7 @@ mod imu;
 mod math;
 mod parameters;
 mod pipeline;
+mod rate_limit;
 mod stamp;
 mod warp;
 mod warp_bridge;
@@ -27,7 +28,8 @@ use bus::BusWatch;
 use eis::Stabilizer;
 use imu::{ImuBuffer, ImuSample, SharedImu};
 use parameters::{Parameters, StabilizeConfig};
-use pipeline::{JpegCodec, JpegCodecChoice};
+use pipeline::{JpegCodec, JpegCodecChoice, PipelineConfig};
+use rate_limit::RateLimiter;
 use stamp::FrameTiming;
 use warp_bridge::{SharedStamps, WarpTiming};
 
@@ -89,6 +91,7 @@ impl CameraFeederNode {
                 let description = pipeline::build_pipeline_string(&config.pipeline);
                 log_info!(node.logger(), "[CameraFeederNode] pipeline: {description}");
                 let pipeline = parse(&description)?;
+                limit_rate(&pipeline, &config.pipeline)?;
                 appsink(&pipeline, pipeline::ROS_SINK_NAME)?.set_callbacks(frame_publisher(
                     publisher,
                     node.get_clock(),
@@ -112,6 +115,7 @@ impl CameraFeederNode {
                     descriptions.output
                 );
                 let capture = parse(&descriptions.capture)?;
+                limit_rate(&capture, &config.pipeline)?;
                 let output = parse(&descriptions.output)?;
                 let appsrc = output
                     .by_name(pipeline::WARPED_SRC_NAME)
@@ -249,6 +253,48 @@ fn parse(description: &str) -> Result<gst::Pipeline, Box<dyn Error>> {
     Ok(gst::parse::launch(description)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "the pipeline description did not produce a gst::Pipeline")?)
+}
+
+/// Drops frames down to `ros_framerate` at the pipeline's rate-limit element, by PTS and without
+/// restamping the ones it keeps (`rate_limit.rs` has why not `videorate`). Nothing to do at full
+/// rate, where the element does not exist.
+///
+/// A sink-pad probe, so a dropped frame never enters the element, nor the queue and decoder after
+/// it on the stabilized path. The probe runs on the one streaming thread that pushes into the
+/// element, so the lock is never contended; it is there because a probe must be `Fn + Sync`.
+///
+/// A rejected frame is returned as `Handled`, not `Drop`. gstreamer-rs (0.24.5, and 0.25.4 the
+/// same) takes the buffer out of the probe info before calling the probe and, on `Drop`, frees it
+/// and leaves the info's data NULL; GStreamer 1.20's chain path then unrefs that NULL itself, a
+/// `gst_mini_object_unref: assertion 'mini_object != NULL' failed` CRITICAL for every dropped
+/// frame (30 a second on robot01). `Handled` tells the core the probe consumed the buffer, which
+/// is what the binding did, and the flow return stays OK.
+fn limit_rate(pipeline: &gst::Pipeline, config: &PipelineConfig) -> Result<(), Box<dyn Error>> {
+    if !pipeline::is_rate_limited(config) {
+        return Ok(());
+    }
+    let pad = pipeline
+        .by_name(pipeline::RATE_LIMIT_NAME)
+        .and_then(|element| element.static_pad("sink"))
+        .ok_or("the pipeline has no rate-limit element")?;
+    let limiter = Mutex::new(RateLimiter::new(config.framerate, config.ros_framerate));
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let pts = info
+            .buffer()
+            .and_then(|buffer| buffer.pts())
+            .map(gst::ClockTime::nseconds);
+        if limiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keep(pts)
+        {
+            gst::PadProbeReturn::Ok
+        } else {
+            gst::PadProbeReturn::Handled
+        }
+    })
+    .ok_or("the rate-limit probe could not be added")?;
+    Ok(())
 }
 
 fn appsink(pipeline: &gst::Pipeline, name: &str) -> Result<gst_app::AppSink, Box<dyn Error>> {

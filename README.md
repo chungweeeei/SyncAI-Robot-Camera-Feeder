@@ -17,7 +17,7 @@ On a Jetson the JPEG decode and re-encode run on the hardware JPEG blocks (`jpeg
 elsewhere they fall back to `jpegdec` / `jpegenc`:
 
 ```
-v4l2src (MJPEG @60) ── videorate @30 ── nvv4l2decoder ─ nvvidconv (I420) ── appsink ─┐
+v4l2src (MJPEG @60) ── rate limit @30 ── nvv4l2decoder ─ nvvidconv (I420) ── appsink ─┐
                                                  <robot_id>/livox/imu ─┤ warp by the orientation at capture time (Rust)
                        appsrc ── nvjpegenc ── tee ─┬─ rtpjpegpay ─ udpsink ◄───────────┘
                                                    └─ appsink ─► image_raw/compressed
@@ -50,7 +50,10 @@ a pipeline error). Not yet run against the real camera on the robot.
   says so.
 - **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
   pipeline clock (`src/camera_feeder_node/stamp.rs`); with stabilization on, the stamp computed
-  on the capture pipeline travels to the output pipeline's appsink keyed by PTS.
+  on the capture pipeline travels to the output pipeline's appsink keyed by PTS. The rate limit
+  down to `ros_framerate` drops frames by PTS and restamps none
+  (`src/camera_feeder_node/rate_limit.rs`); `videorate`, which did it until 2026-10-16, put
+  every stamp up to 16.7 ms early, so stamps in bags recorded before then are biased.
 - **`camera_info`** comes from the YAML `camera_calibration` writes (`ost.yaml`), read once at
   start. The launch file looks for it at `~/robot_ws/config/calibration/<robot_id>/camera0.yaml`
   (`camera_info_file:=` overrides it), since intrinsics belong to one physical camera. A missing

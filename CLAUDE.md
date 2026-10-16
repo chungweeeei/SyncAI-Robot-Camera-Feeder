@@ -81,6 +81,7 @@ container whose device is missing).
 | `parameters.rs` | The load-time (read-only) parameters, validated into `Config`; the validators are unit-tested |
 | `pipeline.rs` | **Pure** pipeline description and `extra-controls` string; unit-tested |
 | `stamp.rs` | **Pure** capture-stamp math (node clock now − frame age on the pipeline clock); unit-tested |
+| `rate_limit.rs` | **Pure** choice of which frames to keep for `ros_framerate`, by PTS, restamping none; unit-tested |
 | `camera_info.rs` | **Pure** parser / validator of `camera_calibration`'s `ost.yaml` for `camera_info`; rejects rather than publishes a wrong calibration (another resolution, short matrices, unknown model); unit-tested |
 | `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
 | `math.rs` | **Pure** `Quat` / `Mat3` (no nalgebra: nothing current builds on rustc 1.85); unit-tested |
@@ -102,6 +103,17 @@ The capture stamp is computed on the capture pipeline and handed to the output a
 PTS-keyed table (`StampTable`), because the two pipelines have different clocks and base times.
 Frames without an orientation (no IMU yet, IMU stale) pass through zoomed but unwarped, with a
 throttled warning; the pipeline never stalls on the IMU.
+
+**Nothing between `v4l2src` and a stamp may restamp a frame.** The message stamp is the buffer's
+PTS turned into node time (`stamp.rs`), so an element that rewrites PTS silently moves every stamp,
+and on the stabilized path the IMU lookup with it. Two have: `jpegparse` (see "Hardware JPEG"
+below), and `videorate`, which did the rate limit down to `ros_framerate` until 2026-10-16 and
+stamped every frame it kept with its output slot's time. That put each stamp up to one capture
+period (16.7 ms) early, by an amount fixed for the run and different on every start. The rate limit
+is now a sink-pad probe on an `identity name=rate_limit` that drops by PTS (`rate_limit.rs`,
+`limit_rate` in `mod.rs`); unit tests keep both elements out of every chain. If it happens again,
+the stamps give it away: restamped ones sit on an exact grid (period jitter ~0.02 ms at 30 fps),
+which real capture stamps never do (~0.3 ms).
 
 **Threading:** no rclrs worker or timer. The one executor callback is the IMU subscription
 (`node.create_subscription`, only with `stabilize` on); it runs on the executor thread `main.rs`
@@ -139,7 +151,9 @@ from the host, which is why the Workspace's robot container runs `runtime: nvidi
 software chain. Measured in robot01 (AGX Orin, JetPack 6 / R36.4, the real camera, a 200 Hz IMU,
 release build) at `ros_framerate` 30: the node fell from ~2.5 to ~1.9 cores (the encoder thread
 from ~28% to ~0; the rest is the rayon warp, which dominates), a frame's age at the warp from ~34
-to ~23 ms and at a ROS subscriber from ~53 to ~35 ms, both at 30.0 Hz; the encoded image is the
+to ~23 ms and at a ROS subscriber from ~53 to ~35 ms, both at 30.0 Hz (the ages were measured on
+`videorate`'s restamped PTS, on different starts, so each is overstated by up to 16.7 ms and the
+gain is uncertain by as much; the CPU figures are unaffected); the encoded image is the
 same (both at quality 85). 60 fps stabilized was not pursued: there the hardware codec saved
 nothing measurable (~3.2–3.3 cores either way). Four things the chain depends on:
 
