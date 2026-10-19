@@ -31,8 +31,9 @@ const DEFAULT_ACCEL_SCALE: f64 = 9.806_65;
 /// The TF rotation parent = IMU (REP-103 body: x forward, y left, z up), child = optical frame
 /// (x right, y down, z forward).
 const DEFAULT_IMU_TO_CAMERA_RPY_DEG: [f64; 3] = [-90.0, 0.0, -90.0];
-// Per stage. Two stages at 0.35 s pass 5 % of a 2 Hz gait shake and follow a steady pan 0.7 s
-// behind; the single 0.5 s stage before them passed 16 % with 0.5 s of lag (see SmoothingOrder).
+// Per stage. Two stages at 0.35 s left 10.5 % of the vertical gait shake outside turns on the
+// dp1f_with_image bag and follow a steady pan 0.7 s behind; the single 0.5 s stage before them left
+// 17 % with 0.5 s of lag (see SmoothingOrder).
 const DEFAULT_SMOOTHING_TAU_S: f64 = 0.35;
 const DEFAULT_SMOOTHING_ORDER: i64 = 2;
 const DEFAULT_ZOOM: f64 = 1.15;
@@ -41,7 +42,8 @@ const DEFAULT_MAX_IMU_WAIT_MS: f64 = 5.0;
 const MAX_IMU_WAIT_MS: f64 = 50.0;
 const MAX_IMU_TIME_OFFSET_MS: f64 = 500.0;
 // Small on purpose: the warp only uses relative rotation, and a larger gain feeds the gait's
-// fore-aft accelerations into the tilt (0.5 let ~0.23° of a 2 Hz surge through; see imu::Mahony).
+// fore-aft accelerations into the tilt (on the dp1f_with_image bag 0.5 added 2.0 px of vertical
+// gait-band shake, 0.05 0.2 px; see imu::Mahony).
 const DEFAULT_MAHONY_KP: f64 = 0.05;
 const MAX_MAHONY_KP: f64 = 10.0;
 const DEFAULT_JPEG_CODEC: &str = "auto";

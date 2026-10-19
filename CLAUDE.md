@@ -179,6 +179,22 @@ The first frame after a start is ~370 ms old at the warp while the decoder initi
 steady from the next stats line on. The warp itself stays on the CPU (rayon); the GPU path for it
 would be VPI, which is not a GStreamer element. Transcoding for WebRTC stays in the worker.
 
+## Tuning the stabilization (`tools/eis_fit.py`)
+
+An offline Python tool, not part of the package build and not run by CI. It needs `rosbag2_py`,
+OpenCV and NumPy, which the robot container has (the Dev Container and the host do not), so run it
+there on a bag under the Workspace (`~/robot_ws/record/<bag>`), without `python3 -I`, which drops
+the ROS `PYTHONPATH`:
+
+- `filters BAG`: IMU only. Replays `imu.rs` / `eis.rs` over the bag's IMU at the frame rate and
+  prints the gait-band (1-6 Hz) shake each smoothing setting leaves and each Mahony gain injects.
+- `offset BAG`: fits `imu_time_offset_ms` from raw frames (stabilize off) against the gyro. The
+  frames' stamps must be the capture's own, i.e. recorded after 2026-10-16 17:50 (`ece6437`).
+- `residual BAG [--stabilized]`: the gait-band shake measured in a recording's frames, for an A/B.
+
+Its orientation filter and low-pass mirror `imu.rs` and `eis.rs` line for line, and it reads the
+params file the way `parameters.rs` does: change them together.
+
 ## GStreamer version pin
 
 The robot container is Ubuntu 22.04 with GStreamer **1.20.3**, and the Tegra elements the WebRTC

@@ -42,9 +42,10 @@ pub struct MahonyGains {
 /// The same holds for tilt, so the accelerometer term is not there for an absolute horizon (the
 /// warp never uses one) but to keep slow gyro drift bounded, and its gain should be small. The
 /// correction low-passes the accelerometer's apparent tilt with a corner at `kp / 2π`, and a
-/// walking robot's fore-aft accelerations *are* apparent tilt at the gait frequency: 0.1 g at
-/// 2 Hz reads as 5.7°, of which kp 0.5 let 4 % (0.23°, ~3.5 px at the zoomed focal length) into
-/// the orientation — shake the stabilizer then added to the image. kp 0.05 lets 0.4 % in.
+/// walking robot's fore-aft accelerations *are* apparent tilt at the gait frequency, and what the
+/// filter lets in is shake the stabilizer then adds to the image. Replayed on the dp1f_with_image
+/// bag (`tools/eis_fit.py filters`), kp 0.5 added 2.0 px RMS of vertical gait-band shake at the
+/// zoomed focal length — as much as the low-pass left of the real shake — and kp 0.05 0.2 px.
 #[derive(Clone, Debug)]
 pub struct Mahony {
     /// world_from_body.

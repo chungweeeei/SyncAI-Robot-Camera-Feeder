@@ -57,10 +57,17 @@ impl Intrinsics {
 /// How many first-order stages the virtual camera's low-pass cascades.
 ///
 /// What the image shows is the virtual camera's own motion, so the residual shake is the
-/// low-pass's gain at the gait frequency (~2 Hz on this robot): `1/√(1+(ωτ)²)` per stage. One
-/// stage at τ 0.5 s still lets 16 % of a 2 Hz pitch through; two at τ 0.35 s let 5 % through and
-/// follow a steady pan 0.7 s behind rather than 0.5 s. Two equal stages are critically damped, so
-/// the view never overshoots and swings back when a turn ends.
+/// low-pass's gain at the gait frequency, `1/√(1+(ωτ)²)` per stage (robot01 trots with its pitch,
+/// the vertical image motion, at 3.8 Hz and its yaw at 1.9 Hz). Replayed on the dp1f_with_image
+/// bag (`tools/eis_fit.py filters`), one stage at τ 0.5 s left 17 % of the vertical gait-band
+/// shake wherever the clamp was not holding the view, two at τ 0.35 s 10.5 %, for following a
+/// steady pan 0.7 s behind rather than 0.5 s. Two equal stages are critically damped, so the view
+/// never overshoots and swings back when a turn ends.
+///
+/// Wherever the clamp *is* holding it, the real camera's shake goes straight through whatever
+/// the order: turns use up the zoom's margin (11-13 % of that bag's frames, a little more the
+/// longer the lag), which is why the bag's overall vertical residual only went from 1.73 px to
+/// 1.64 px.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothingOrder {
     First,
