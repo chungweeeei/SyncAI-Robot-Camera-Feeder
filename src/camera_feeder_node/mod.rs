@@ -187,13 +187,14 @@ impl CameraFeederNode {
             ),
             Some(stabilize) => log_info!(
                 node.logger(),
-                "[CameraFeederNode] streaming {}x{}@{}, stabilized by {} (zoom {}, tau {} s) at {} fps \
-                 to {}:{} (RTP/JPEG) and image_raw/compressed",
+                "[CameraFeederNode] streaming {}x{}@{}, stabilized by {} (zoom {}, {} x tau {} s) \
+                 at {} fps to {}:{} (RTP/JPEG) and image_raw/compressed",
                 config.pipeline.width,
                 config.pipeline.height,
                 config.pipeline.framerate,
                 stabilize.imu_topic,
                 stabilize.eis.zoom,
+                stabilize.eis.smoothing_order.stages(),
                 stabilize.eis.smoothing_tau_s,
                 config.pipeline.ros_framerate,
                 config.pipeline.rtp_host,

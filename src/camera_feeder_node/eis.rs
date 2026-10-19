@@ -2,8 +2,9 @@
 //! frame into a steadier virtual camera.
 //!
 //! Gyro-based electronic image stabilization in the Karpenko et al. (2011) / Gyroflow mould. The
-//! true orientation `q(t)` is low-passed into the virtual camera's orientation `q_s(t)`; the
-//! frame is then re-projected from the real camera into the virtual one. Only rotation is
+//! true orientation `q(t)` is low-passed into the virtual camera's orientation `q_s(t)` (two
+//! cascaded first-order stages by default, see [`SmoothingOrder`]); the frame is then
+//! re-projected from the real camera into the virtual one. Only rotation is
 //! compensated, so the re-projection is a homography `H = K_out · R · K⁻¹` with no depth involved:
 //! `K` the intrinsics, `R` the real-to-virtual rotation in the optical frame, and `K_out` the
 //! intrinsics scaled by the zoom that hides the borders the warp uncovers.
@@ -53,6 +54,29 @@ impl Intrinsics {
     }
 }
 
+/// How many first-order stages the virtual camera's low-pass cascades.
+///
+/// What the image shows is the virtual camera's own motion, so the residual shake is the
+/// low-pass's gain at the gait frequency (~2 Hz on this robot): `1/√(1+(ωτ)²)` per stage. One
+/// stage at τ 0.5 s still lets 16 % of a 2 Hz pitch through; two at τ 0.35 s let 5 % through and
+/// follow a steady pan 0.7 s behind rather than 0.5 s. Two equal stages are critically damped, so
+/// the view never overshoots and swings back when a turn ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothingOrder {
+    First,
+    Second,
+}
+
+impl SmoothingOrder {
+    #[must_use]
+    pub fn stages(self) -> u8 {
+        match self {
+            Self::First => 1,
+            Self::Second => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EisConfig {
     pub intrinsics: Intrinsics,
@@ -61,9 +85,12 @@ pub struct EisConfig {
     /// Output magnification, >= 1. The warp uncovers a border of up to
     /// `(1 - 1/zoom)` of each half-size; see [`max_hidden_angle`].
     pub zoom: f64,
-    /// Time constant of the first-order low-pass that the virtual camera follows the real one
-    /// with. Larger is steadier, and drifts further from the real framing.
+    /// Time constant of each first-order stage of the low-pass that the virtual camera follows
+    /// the real one with. Larger is steadier, and drifts further from the real framing: a steady
+    /// pan is followed `stages × τ` behind.
     pub smoothing_tau_s: f64,
+    /// How many such stages; see [`SmoothingOrder`].
+    pub smoothing_order: SmoothingOrder,
     /// The rotation taking IMU-frame vectors into the camera optical frame.
     pub cam_from_imu: Mat3,
 }
@@ -72,8 +99,9 @@ pub struct EisConfig {
 #[derive(Clone, Debug)]
 pub struct Stabilizer {
     config: EisConfig,
-    /// (stamp, `q_s`) of the previous frame, in the IMU frame.
-    smoothed: Option<(i64, Quat)>,
+    /// The stamp of the previous frame and the output of each low-pass stage there, in the IMU
+    /// frame. The last stage is `q_s`; with [`SmoothingOrder::First`] both hold the same value.
+    smoothed: Option<(i64, [Quat; 2])>,
     max_angle: f64,
     k_out: Intrinsics,
 }
@@ -108,15 +136,26 @@ impl Stabilizer {
     /// `q_imu` (world_from_imu) at the frame's capture time `stamp_ns`. Advances the virtual
     /// camera, so it is called once per frame, in order.
     pub fn correction(&mut self, stamp_ns: i64, q_imu: Quat) -> Mat3 {
-        let q_s = match self.smoothed {
-            None => q_imu,
-            Some((previous_stamp, previous)) => {
+        let stages = match self.smoothed {
+            None => [q_imu; 2],
+            Some((previous_stamp, [first, second])) => {
                 let dt_s = (stamp_ns - previous_stamp).max(0) as f64 / 1e9;
-                let followed = smooth(previous, q_imu, dt_s, self.config.smoothing_tau_s);
-                clamp_toward(followed, q_imu, self.max_angle)
+                let tau_s = self.config.smoothing_tau_s;
+                // Every stage is clamped toward the real orientation, not only the output: an
+                // unclamped first stage winds up during a long turn (it lags rate × τ, past what
+                // the zoom hides) and then holds the output at the clamp after the turn has ended.
+                let first = clamp_toward(smooth(first, q_imu, dt_s, tau_s), q_imu, self.max_angle);
+                let second = match self.config.smoothing_order {
+                    SmoothingOrder::First => first,
+                    SmoothingOrder::Second => {
+                        clamp_toward(smooth(second, first, dt_s, tau_s), q_imu, self.max_angle)
+                    }
+                };
+                [first, second]
             }
         };
-        self.smoothed = Some((stamp_ns, q_s));
+        self.smoothed = Some((stamp_ns, stages));
+        let q_s = stages[1];
 
         // A world direction seen by the real camera is `C · R_imuᵀ · d`, by the virtual one
         // `C · R_sᵀ · d`; the rotation from real to virtual is therefore `C · R_sᵀ · R_imu · Cᵀ`.
@@ -189,8 +228,21 @@ mod tests {
             height: 720,
             zoom: 1.15,
             smoothing_tau_s: 0.5,
+            smoothing_order: SmoothingOrder::First,
             cam_from_imu: Mat3::IDENTITY,
         }
+    }
+
+    impl Stabilizer {
+        /// `q_s` after the last frame.
+        fn virtual_camera(&self) -> Quat {
+            self.smoothed.expect("a frame has been corrected").1[1]
+        }
+    }
+
+    /// The signed angle about y of a rotation about y.
+    fn angle_about_y(q: Quat) -> f64 {
+        2.0 * q.y.atan2(q.w)
     }
 
     /// Where `h` sends the pixel `(u, v)`.
@@ -284,14 +336,18 @@ mod tests {
             "{max}"
         );
 
-        let mut s = Stabilizer::new(cfg);
-        s.correction(0, Quat::IDENTITY);
-        // A sudden 20° pitch: far more than the margin hides.
-        let big = Quat::from_axis_angle([1.0, 0.0, 0.0], 20f64.to_radians());
-        s.correction(1, big);
-        let (_, q_s) = s.smoothed.unwrap();
-        let residual = (q_s.conjugate() * big).angle();
-        assert!(residual <= max + 1e-9, "{residual} > {max}");
+        for order in [SmoothingOrder::First, SmoothingOrder::Second] {
+            let mut s = Stabilizer::new(EisConfig {
+                smoothing_order: order,
+                ..cfg
+            });
+            s.correction(0, Quat::IDENTITY);
+            // A sudden 20° pitch: far more than the margin hides.
+            let big = Quat::from_axis_angle([1.0, 0.0, 0.0], 20f64.to_radians());
+            s.correction(1, big);
+            let residual = (s.virtual_camera().conjugate() * big).angle();
+            assert!(residual <= max + 1e-9, "{order:?}: {residual} > {max}");
+        }
     }
 
     #[test]
@@ -311,9 +367,7 @@ mod tests {
             let q = Quat::from_axis_angle([0.0, 1.0, 0.0], angle);
             s.correction((t * 1e9) as i64, q);
             raw.push(angle);
-            let (_, q_s) = s.smoothed.unwrap();
-            // Signed angle about y.
-            smoothed.push(2.0 * q_s.y.atan2(q_s.w));
+            smoothed.push(angle_about_y(s.virtual_camera()));
         }
         let variance = |v: &[f64]| {
             let mean = v.iter().sum::<f64>() / v.len() as f64;
@@ -321,6 +375,111 @@ mod tests {
         };
         let (raw_var, smoothed_var) = (variance(&raw[30..]), variance(&smoothed[30..]));
         assert!(smoothed_var < raw_var / 10.0, "{raw_var} -> {smoothed_var}");
+    }
+
+    /// The steady-state amplitude of the virtual camera, as a fraction of the real camera's, for
+    /// a 1° pitch at `hz` sampled at 30 fps (6 s, measured over the last 2).
+    fn residual_ratio(order: SmoothingOrder, tau_s: f64, hz: f64) -> f64 {
+        // Zoom 2 keeps the clamp out of the way.
+        let mut s = Stabilizer::new(EisConfig {
+            zoom: 2.0,
+            smoothing_tau_s: tau_s,
+            smoothing_order: order,
+            ..config()
+        });
+        let amplitude = 1f64.to_radians();
+        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+        for i in 0..180 {
+            let t = f64::from(i) / 30.0;
+            let angle = amplitude * (2.0 * std::f64::consts::PI * hz * t).sin();
+            s.correction(
+                (t * 1e9) as i64,
+                Quat::from_axis_angle([0.0, 1.0, 0.0], angle),
+            );
+            if i >= 120 {
+                let virtual_angle = angle_about_y(s.virtual_camera());
+                low = low.min(virtual_angle);
+                high = high.max(virtual_angle);
+            }
+        }
+        (high - low) / 2.0 / amplitude
+    }
+
+    #[test]
+    fn each_stage_attenuates_the_gait_frequency_as_a_first_order_low_pass() {
+        let gain = |tau_s: f64, hz: f64| {
+            let w_tau = 2.0 * std::f64::consts::PI * hz * tau_s;
+            1.0 / (1.0 + w_tau * w_tau).sqrt()
+        };
+        // Discretisation at 30 fps moves these by ~1-2 %; 10 % is slack, not tolerance for a
+        // wrong order.
+        for (order, tau_s, expected) in [
+            (SmoothingOrder::First, 0.5, gain(0.5, 2.0)),
+            (SmoothingOrder::Second, 0.35, gain(0.35, 2.0).powi(2)),
+            (SmoothingOrder::Second, 0.25, gain(0.25, 2.0).powi(2)),
+        ] {
+            let ratio = residual_ratio(order, tau_s, 2.0);
+            assert!(
+                (ratio - expected).abs() < 0.1 * expected,
+                "{order:?} tau {tau_s}: {ratio} vs {expected}"
+            );
+        }
+        // The point of the second stage: a third of the shake for 1.4x the pan lag.
+        assert!(
+            residual_ratio(SmoothingOrder::Second, 0.35, 2.0)
+                < residual_ratio(SmoothingOrder::First, 0.5, 2.0) / 3.0
+        );
+    }
+
+    #[test]
+    fn the_second_order_view_settles_without_overshoot() {
+        let mut s = Stabilizer::new(EisConfig {
+            zoom: 2.0,
+            smoothing_order: SmoothingOrder::Second,
+            ..config()
+        });
+        s.correction(0, Quat::IDENTITY);
+        // The real camera steps 3° and stays; the virtual one must approach it monotonically.
+        let target_angle = 3f64.to_radians();
+        let target = Quat::from_axis_angle([0.0, 1.0, 0.0], target_angle);
+        let mut previous = 0.0;
+        for i in 1..=150 {
+            s.correction(i64::from(i) * 33_333_333, target);
+            let angle = angle_about_y(s.virtual_camera());
+            assert!(angle >= previous - 1e-12, "frame {i}: {angle} < {previous}");
+            assert!(
+                angle <= target_angle + 1e-12,
+                "frame {i}: {angle} overshoots"
+            );
+            previous = angle;
+        }
+        // 5 s is 7 time constants per stage: settled.
+        assert!(
+            (previous - target_angle).abs() < 1e-3 * target_angle,
+            "{previous}"
+        );
+    }
+
+    #[test]
+    fn reset_forgets_every_stage() {
+        let mut s = Stabilizer::new(EisConfig {
+            zoom: 2.0,
+            smoothing_order: SmoothingOrder::Second,
+            ..config()
+        });
+        s.correction(0, Quat::IDENTITY);
+        s.correction(1, Quat::from_axis_angle([0.0, 1.0, 0.0], 0.05));
+        s.reset();
+        // After a reset the next frame is the virtual camera again: no correction.
+        let q = Quat::from_axis_angle([1.0, 0.0, 0.0], 0.2);
+        let h = s.correction(2, q);
+        let p = s.passthrough();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((h.0[i][j] - p.0[i][j]).abs() < 1e-9);
+            }
+        }
+        assert_eq!(s.smoothed.unwrap().1, [q; 2]);
     }
 
     #[test]

@@ -47,7 +47,9 @@ a pipeline error). Not yet run against the real camera on the robot.
   instead of ~53) and the CPU otherwise. It needs the
   camera intrinsics and the IMU-to-camera rotation calibrated; the parameters file explains each
   knob. Without IMU samples the frames pass through (zoomed, unwarped) and a throttled warning
-  says so.
+  says so. The virtual camera follows the real one through two cascaded first-order low-pass
+  stages (`smoothing_order`, `smoothing_time_constant_s`), which pass a third of the walking
+  shake one stage did.
 - **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
   pipeline clock (`src/camera_feeder_node/stamp.rs`); with stabilization on, the stamp computed
   on the capture pipeline travels to the output pipeline's appsink keyed by PTS. The rate limit
