@@ -188,7 +188,7 @@ impl CameraFeederNode {
             Some(stabilize) => log_info!(
                 node.logger(),
                 "[CameraFeederNode] streaming {}x{}@{}, stabilized by {} (zoom {}, {} x tau {} s, \
-                 mahony kp {}) at {} fps to {}:{} (RTP/JPEG) and image_raw/compressed",
+                 {}, mahony kp {}) at {} fps to {}:{} (RTP/JPEG) and image_raw/compressed",
                 config.pipeline.width,
                 config.pipeline.height,
                 config.pipeline.framerate,
@@ -196,6 +196,13 @@ impl CameraFeederNode {
                 stabilize.eis.zoom,
                 stabilize.eis.smoothing_order.stages(),
                 stabilize.eis.smoothing_tau_s,
+                stabilize.eis.turn_damping.map_or_else(
+                    || "no turn damping".to_string(),
+                    |d| format!(
+                        "turn damping above {} rad/s, halved at +{} rad/s",
+                        d.deadband_rad_s, d.reference_rad_s
+                    ),
+                ),
                 stabilize.mahony.kp,
                 config.pipeline.ros_framerate,
                 config.pipeline.rtp_host,

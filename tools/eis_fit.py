@@ -62,10 +62,15 @@ class Config:
     height: int
     fx: float
     fy: float
+    cx: float
+    cy: float
     zoom: float
     cam_from_imu: np.ndarray  # 3x3, IMU-frame vectors into the optical frame
     smoothing_order: int
     smoothing_tau_s: float
+    turn_rate_tau_s: float
+    turn_deadband_rad_s: float
+    turn_reference_rad_s: float  # 0: no turn damping
     mahony_kp: float
     accel_scale: float
     frame_rate: float  # what the stabilized path runs at: ros_framerate
@@ -75,15 +80,42 @@ class Config:
     use_header_stamp: bool
 
     @property
-    def max_angle(self) -> float:
-        """eis.rs max_hidden_angle: what the zoom's border can hide, in radians."""
+    def hidden_angles(self) -> tuple[float, float]:
+        """eis.rs hidden_angles: the (pan, tilt) the zoom's border can hide, in radians, measured
+        at the frame's edges."""
 
-        def margin(half: float) -> float:
-            return half * (1.0 - 1.0 / max(self.zoom, 1.0))
+        def hidden(near: float, far: float, f: float) -> float:
+            def one_side(half: float) -> float:
+                return math.atan(half / f) - math.atan(half / (f * max(self.zoom, 1.0)))
 
-        horizontal = math.atan(margin(self.width / 2.0) / self.fx)
-        vertical = math.atan(margin(self.height / 2.0) / self.fy)
-        return min(horizontal, vertical)
+            return min(one_side(near), one_side(far))
+
+        return (
+            hidden(self.cx, self.width - self.cx, self.fx),
+            hidden(self.cy, self.height - self.cy, self.fy),
+        )
+
+    def covers(self, real_to_virtual: np.ndarray) -> bool:
+        """Stabilizer::covers: whether every output pixel samples inside the frame, given the
+        rotation (IMU frame, virtual_from_real) between the real and the virtual camera."""
+        k = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1.0]])
+        k_out_inv = np.array(
+            [
+                [1 / (self.fx * self.zoom), 0, -self.cx / (self.fx * self.zoom)],
+                [0, 1 / (self.fy * self.zoom), -self.cy / (self.fy * self.zoom)],
+                [0, 0, 1.0],
+            ]
+        )
+        r = self.cam_from_imu @ real_to_virtual @ self.cam_from_imu.T
+        inverse = k @ r.T @ k_out_inv
+        right, bottom = self.width - 0.5, self.height - 0.5
+        for u, v in ((0.5, 0.5), (right, 0.5), (0.5, bottom), (right, bottom)):
+            x, y, w = inverse @ np.array([u, v, 1.0])
+            if w <= 0.0 or not (0.5 - 1e-9 <= x / w <= right + 1e-9):
+                return False
+            if not (0.5 - 1e-9 <= y / w <= bottom + 1e-9):
+                return False
+        return True
 
 
 def rpy_deg_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -104,6 +136,8 @@ def load_config(path: Path) -> Config:
     # 0 means the resolution-derived guess, exactly as parameters.rs::intrinsics.
     fx = float(params.get("fx", 0.0)) or width / 2.0
     fy = float(params.get("fy", 0.0)) or fx
+    cx = float(params.get("cx", 0.0)) or width / 2.0
+    cy = float(params.get("cy", 0.0)) or height / 2.0
     framerate = int(params.get("framerate", 60))
     ros_framerate = int(params.get("ros_framerate", 30))
     if ros_framerate <= 0 or ros_framerate > framerate:
@@ -117,10 +151,15 @@ def load_config(path: Path) -> Config:
         height=height,
         fx=fx,
         fy=fy,
+        cx=cx,
+        cy=cy,
         zoom=float(params.get("zoom", 1.15)),
         cam_from_imu=rpy_deg_matrix(*params.get("imu_to_camera_rpy_deg", [-90.0, 0.0, -90.0])).T,
         smoothing_order=int(params.get("smoothing_order", 2)),
         smoothing_tau_s=float(params.get("smoothing_time_constant_s", 0.35)),
+        turn_rate_tau_s=float(params.get("turn_rate_time_constant_s", 0.3)),
+        turn_deadband_rad_s=float(params.get("turn_damping_deadband_rad_s", 0.1)),
+        turn_reference_rad_s=float(params.get("turn_damping_reference_rad_s", 0.15)),
         mahony_kp=float(params.get("mahony_kp", 0.05)),
         accel_scale=float(params.get("imu_accel_scale", 9.80665)),
         frame_rate=float(ros_framerate),
@@ -315,33 +354,116 @@ def clamp_toward(q_s: Quat, q: Quat, max_angle: float) -> Quat:
     return q_slerp(q_s, q, (angle - max_angle) / angle)
 
 
+def wrap_angle(a: float) -> float:
+    return math.remainder(a, 2.0 * math.pi)
+
+
+def heading(q: Quat) -> float:
+    """eis.rs heading: the rotation about world z of a world_from_body orientation."""
+    w, x, y, z = q
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def low_pass(previous: float, current: float, dt_s: float, tau_s: float) -> float:
+    if tau_s <= 0.0:
+        return current
+    return previous + (current - previous) * (1.0 - math.exp(-dt_s / tau_s))
+
+
+def effective_tau(config: Config, tau_s: float, turn_rate: float, reference: float) -> float:
+    """TurnDamping::effective_tau."""
+    excess = max(abs(turn_rate) - config.turn_deadband_rad_s, 0.0) / reference
+    return tau_s / (1.0 + excess * excess)
+
+
+# eis.rs FIT_ITERATIONS.
+FIT_ITERATIONS = 20
+
+
+def fit_to_frame(config: Config, q_s: Quat, q: Quat) -> tuple[Quat, bool]:
+    """Stabilizer::fit_to_frame: q_s, or the nearest orientation toward q that leaves no border;
+    and whether it had to move."""
+
+    def covers(candidate: Quat) -> bool:
+        return config.covers(quats_matrix(np.asarray([q_mul(q_conj(candidate), q)]))[0])
+
+    if covers(q_s):
+        return q_s, False
+    low, high = 0.0, 1.0
+    for _ in range(FIT_ITERATIONS):
+        mid = 0.5 * (low + high)
+        if covers(q_slerp(q_s, q, mid)):
+            high = mid
+        else:
+            low = mid
+    return q_slerp(q_s, q, high), True
+
+
 def virtual_camera(
-    frame_ns: np.ndarray, frame_q: np.ndarray, order: int, tau_s: float, max_angle: float
+    frame_ns: np.ndarray,
+    frame_q: np.ndarray,
+    config: Config,
+    order: int,
+    tau_s: float,
+    turn_reference: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Stabilizer::correction over every frame: the virtual camera's orientations, and whether
-    the clamp held it at each frame (the zoom's margin was used up, so the real camera's motion
-    went straight through)."""
+    the clamp or the fit held it at each frame (the zoom's margin was used up, so the real
+    camera's motion went straight through). turn_reference 0 is no turn damping. frame_q must
+    be levelled with gravity, as the node's filter is, for the heading to be the robot's turn."""
+    max_angle = min(config.hidden_angles)
     out: list[Quat] = []
     clamped: list[bool] = []
     first = second = IDENTITY
+    turn_rate = [0.0, 0.0]
     previous: int | None = None
+    previous_heading = 0.0
     for t, (w, x, y, z) in zip(frame_ns.tolist(), frame_q.tolist()):
         q = (w, x, y, z)
+        heading_now = heading(q)
         if previous is None:
             first = second = q
+            turn_rate = [0.0, 0.0]
         else:
             dt = max(t - previous, 0) / 1e9
-            first = clamp_toward(smooth(first, q, dt, tau_s), q, max_angle)
+            tau = tau_s
+            if turn_reference > 0.0:
+                if dt > 0.0:
+                    rate = wrap_angle(heading_now - previous_heading) / dt
+                    turn_rate[0] = low_pass(turn_rate[0], rate, dt, config.turn_rate_tau_s)
+                    turn_rate[1] = low_pass(turn_rate[1], turn_rate[0], dt, config.turn_rate_tau_s)
+                tau = effective_tau(config, tau_s, turn_rate[1], turn_reference)
+            first = clamp_toward(smooth(first, q, dt, tau), q, max_angle)
             if order == 1:
                 second = first
             else:
-                second = clamp_toward(smooth(second, first, dt, tau_s), q, max_angle)
+                second = clamp_toward(smooth(second, first, dt, tau), q, max_angle)
+        q_s, fitted = fit_to_frame(config, second, q)
         clamped.append(
-            previous is not None and q_angle(q_mul(q_conj(second), q)) >= max_angle * (1.0 - 1e-6)
+            previous is not None
+            and (fitted or q_angle(q_mul(q_conj(second), q)) >= max_angle * (1.0 - 1e-6))
         )
-        out.append(second)
-        previous = t
+        out.append(q_s)
+        previous, previous_heading = t, heading_now
     return np.asarray(out), np.asarray(clamped)
+
+
+def turn_slide_deg(config: Config, order: int, tau_s: float, turn_reference: float) -> float:
+    """How far the view still turns after the robot stops, on a synthetic 0.5 rad/s, 3 s turn
+    (ramped over 0.3 s at both ends) of a levelled camera at the frame rate: the slide a viewer
+    sees as the image flowing on after the turn."""
+    fs = config.frame_rate
+    frames = np.arange(int(6 * fs), dtype=np.int64) * int(1e9 / fs)
+    level = q_from_axis_angle((0.0, 1.0, 0.0), 0.25)  # the lidar's mount pitch
+    quats, angle = [], 0.0
+    for i in range(len(frames)):
+        t = i / fs
+        angle += 0.5 * min(max(min(t / 0.3, (3.0 - t) / 0.3), 0.0), 1.0) / fs
+        quats.append(q_mul(q_from_axis_angle((0.0, 0.0, 1.0), angle), level))
+    virtual, _ = virtual_camera(frames, np.asarray(quats), config, order, tau_s, turn_reference)
+    headings = np.unwrap([heading(tuple(q)) for q in virtual.tolist()])
+    stop = int(3 * fs)
+    return float(np.degrees(np.abs(headings[stop:] - headings[stop]).max()))
 
 
 # --- Signal helpers ----------------------------------------------------------------------------
@@ -566,42 +688,59 @@ def run_filters(args: argparse.Namespace, config: Config) -> None:
     )
     print(
         f"frames simulated at {fs:g} Hz; output focal {fx_out:.0f} x {fy_out:.0f} px (zoom "
-        f"{config.zoom:g}); the zoom hides {math.degrees(config.max_angle):.1f} deg; band "
+        f"{config.zoom:g}); the zoom hides {math.degrees(config.hidden_angles[0]):.1f} deg of "
+        f"pan and {math.degrees(config.hidden_angles[1]):.1f} deg of tilt; band "
         f"{band[0]:g}-{band[1]:g} Hz"
     )
 
     stamps, quats = integrate(imu, 0.0)
+    # Level the gyro-only history with the first sample's gravity, as the node's filter starts:
+    # the turn damping reads the heading about world z. A fixed world rotation changes no
+    # relative rotation, so nothing else below sees it.
+    level = align_to_gravity(tuple(imu.accel[0])) or IDENTITY
+    quats = quats_mul(np.tile(np.asarray(level), (len(quats), 1)), quats)
     real = orientation_at(stamps, quats, frames)
     raw_rates = camera_rates(real, config.cam_from_imu, fs)
-    raw_vertical = band_integral(raw_rates[:, 0], fs, band) * fy_out
-    raw_horizontal = band_integral(raw_rates[:, 1], fs, band) * fx_out
-    print(
-        "\nsmoothing (gyro-only orientation, so the low-pass alone is compared). 'free' is the\n"
-        "frames the clamp did not hold (and 0.5 s around them), where the low-pass shapes the\n"
-        "view; while clamped the real camera's motion passes straight through, whatever the\n"
-        "low-pass."
-    )
-    print(
-        "  order  tau s  pan lag  clamped  vertical px  (free, vs raw)"
-        "       horizontal px  (free, vs raw)"
-    )
-    print(
-        f"  raw{'':29s}{rms(raw_vertical):11.2f}{'':22s}{rms(raw_horizontal):13.2f}"
-    )
-    for order, tau in args.configs:
-        virtual, clamped = virtual_camera(frames, real, order, tau, config.max_angle)
-        rates = camera_rates(virtual, config.cam_from_imu, fs)
+    real_heading = np.unwrap([heading(tuple(q)) for q in real.tolist()])
+    # Turning: the heading rate over 1 s above 0.15 rad/s; straight: below 0.05 (per interval).
+    turn_rate = np.convolve(np.diff(real_heading) * fs, np.ones(int(fs)) / int(fs), mode="same")
+    turning, straight = np.abs(turn_rate) > 0.15, np.abs(turn_rate) < 0.05
+
+    def shake(rates: np.ndarray, mask: np.ndarray) -> tuple[float, float]:
         vertical = band_integral(rates[:, 0], fs, band) * fy_out
         horizontal = band_integral(rates[:, 1], fs, band) * fx_out
-        # Rates are per frame interval; an interval is free when the frame ending it is.
-        free = ~dilate(clamped, int(0.5 * fs))[1:]
-        free_v, free_h = rms(vertical[free]), rms(horizontal[free])
-        share_v = 100 * free_v / rms(raw_vertical[free])
-        share_h = 100 * free_h / rms(raw_horizontal[free])
+        return rms(vertical[mask]), rms(horizontal[mask])
+
+    print(
+        f"\nsmoothing (gyro-only orientation, so the low-pass alone is compared), deadband "
+        f"{config.turn_deadband_rad_s:g} rad/s and rate tau {config.turn_rate_tau_s:g} s from the "
+        f"params.\n{100 * straight.mean():.0f} % of the bag walks straight (heading rate < 0.05 "
+        f"rad/s over 1 s), {100 * turning.mean():.0f} % turns (> 0.15). 'held': frames where the "
+        "clamp held the view,\nso the real camera's shake went straight through. 'behind': how far "
+        "the view's heading trails the robot's\nwhile turning (median / p95). 'slide': how far the "
+        "view still turns after a synthetic 0.5 rad/s turn stops."
+    )
+    print(
+        "  order  tau s  turn ref  held    behind deg   slide deg   straight v / h px   "
+        "turning v / h px"
+    )
+    sv, sh = shake(raw_rates, straight)
+    tv, th = shake(raw_rates, turning)
+    print(f"  raw{'':55s}{sv:8.2f} / {sh:5.2f}{tv:12.2f} / {th:5.2f}")
+    for order, tau, reference in args.configs:
+        virtual, clamped = virtual_camera(frames, real, config, order, tau, reference)
+        rates = camera_rates(virtual, config.cam_from_imu, fs)
+        behind = np.degrees(
+            np.abs(np.unwrap([heading(tuple(q)) for q in virtual.tolist()]) - real_heading)
+        )[1:][turning]
+        sv, sh = shake(rates, straight)
+        tv, th = shake(rates, turning)
+        reference_text = f"{reference:8.2f}" if reference > 0.0 else "     off"
         print(
-            f"  {order:5d}  {tau:5.2f}  {order * tau:5.2f} s  {100 * clamped.mean():5.1f} %  "
-            f"{rms(vertical):11.2f}  ({free_v:5.2f}, {share_v:5.1f} %)"
-            f"  {rms(horizontal):13.2f}  ({free_h:5.2f}, {share_h:5.1f} %)"
+            f"  {order:5d}  {tau:5.2f}  {reference_text}  {100 * clamped.mean():4.1f} %  "
+            f"{np.median(behind):4.1f} / {np.percentile(behind, 95):4.1f}  "
+            f"{turn_slide_deg(config, order, tau, reference):9.1f}  "
+            f"{sv:8.2f} / {sh:5.2f}{tv:12.2f} / {th:5.2f}"
         )
 
     print(
@@ -764,11 +903,13 @@ def run_residual(args: argparse.Namespace, config: Config) -> None:
               "(IMU: what the camera itself did)")
 
 
-def smoothing_config(text: str) -> tuple[int, float]:
-    order, tau = text.split(":")
-    if order not in ("1", "2"):
-        raise argparse.ArgumentTypeError(f"order must be 1 or 2: {text}")
-    return int(order), float(tau)
+def smoothing_config(text: str) -> tuple[int, float, float]:
+    """ORDER:TAU[:TURN_REF], TURN_REF being turn_damping_reference_rad_s; without it (or with 0)
+    turns are smoothed like any other motion, as they were until 2026-10-20."""
+    order, tau, *rest = text.split(":")
+    if order not in ("1", "2") or len(rest) > 1:
+        raise argparse.ArgumentTypeError(f"expected ORDER:TAU[:TURN_REF], order 1 or 2: {text}")
+    return int(order), float(tau), float(rest[0]) if rest else 0.0
 
 
 def main() -> None:
@@ -805,8 +946,8 @@ def main() -> None:
         "--configs",
         type=smoothing_config,
         nargs="+",
-        default=[(1, 0.5), (2, 0.25), (2, 0.35), (2, 0.5)],
-        metavar="ORDER:TAU",
+        default=[(2, 0.35, 0.0), (2, 0.35, 0.3), (2, 0.35, 0.2), (2, 0.35, 0.15), (2, 0.35, 0.1)],
+        metavar="ORDER:TAU[:TURN_REF]",
     )
     filters.add_argument("--kps", type=float, nargs="+", default=[0.5, 0.2, 0.05, 0.02])
 

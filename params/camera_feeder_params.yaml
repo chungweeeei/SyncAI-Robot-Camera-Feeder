@@ -126,9 +126,32 @@
     # ends. 1 is the old single stage, for A/B comparison.
     smoothing_order: 2
     smoothing_time_constant_s: 0.35
+    # Turn damping: while the robot turns, each stage's time constant is divided by
+    # 1 + (excess / turn_damping_reference_rad_s)^2, excess being how far the heading rate (about
+    # world z, read through two low-pass stages of turn_rate_time_constant_s so the gait's 1.9 Hz
+    # heading sway averages out) is above turn_damping_deadband_rad_s. Without it a 0.5 rad/s turn
+    # ran the view into the clamp, and when the turn ended the view slid the clamp's worth (5.6
+    # deg) on for ~1.5 s after the robot had stopped: the image "kept flowing" (robot01,
+    # 2026-10-20). The cost is the gait shake during turns, which the clamp mostly let through
+    # anyway. Replayed on record/dp1f_with_image (`tools/eis_fit.py filters`; v / h are gait-band
+    # vertical / horizontal shake in px at the zoomed focal length, 'slide' a synthetic 0.5 rad/s
+    # turn):
+    #   reference   slide    straight v / h   turning v / h   view behind in turns (median)
+    #   off         5.6 deg  0.89 / 6.31      3.21 / 17.61    4.7 deg
+    #   0.30        3.2      0.99 / 6.13      3.80 / 16.79    4.2
+    #   0.20        1.1      1.12 / 6.45      4.71 / 16.98    3.6
+    #   0.15        0.4      1.28 / 6.89      5.38 / 17.84    3.2
+    #   0.10        0.0      1.55 / 7.70      6.09 / 20.41    2.4
+    #   raw                  5.09 / 17.52     8.51 / 24.22
+    # 0 turns it off. Lower is a view that sticks to the turn, higher one that smooths it more.
+    turn_damping_reference_rad_s: 0.15
+    turn_damping_deadband_rad_s: 0.1
+    turn_rate_time_constant_s: 0.3
     # Output magnification, 1.0 to 2.0: the border it crops is what hides the warp. 1.3 hides
-    # about 7 degrees of correction at fx 675 (1.15 hid only 4, which the robot's 0.5 rad/s turns
-    # exhausted); beyond that the correction is clamped rather than showing black.
+    # 7.4 degrees of pan and 5.8 of tilt at fx 675, measured at the frame's edges (the 7 degrees
+    # quoted here until 2026-10-20 was the margin at the centre, which let a clamped tilt show a
+    # black band); beyond that the correction is clamped, and fitted so no corner leaves the frame,
+    # rather than showing black.
     zoom: 1.3
     # How long a frame waits (ms, 0 to 50) for an IMU sample newer than itself before the last
     # gyro reading is extrapolated instead.

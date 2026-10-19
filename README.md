@@ -49,7 +49,10 @@ a pipeline error). Not yet run against the real camera on the robot.
   knob. Without IMU samples the frames pass through (zoomed, unwarped) and a throttled warning
   says so. The virtual camera follows the real one through two cascaded first-order low-pass
   stages (`smoothing_order`, `smoothing_time_constant_s`), which leave ~40 % less of the walking
-  shake than one stage did wherever turns have not used up the zoom's margin; the orientation
+  shake than one stage did wherever turns have not used up the zoom's margin. While the robot
+  turns, the stages are shortened (`turn_damping_*`), so the view keeps up with the turn instead
+  of sliding on for a second after the robot has stopped; and the warp is fitted so that no
+  output pixel falls outside the frame (no black corners). The orientation
   comes from a Mahony filter started level with gravity whose accelerometer gain (`mahony_kp`) is
   kept small, so the gait's surge is not read as tilt.
   `tools/eis_fit.py` fits `imu_time_offset_ms` and compares these settings offline, from a rosbag
