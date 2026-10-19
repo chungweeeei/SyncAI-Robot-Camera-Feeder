@@ -85,7 +85,7 @@ container whose device is missing).
 | `camera_info.rs` | **Pure** parser / validator of `camera_calibration`'s `ost.yaml` for `camera_info`; rejects rather than publishes a wrong calibration (another resolution, short matrices, unknown model); unit-tested |
 | `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
 | `math.rs` | **Pure** `Quat` / `Mat3` (no nalgebra: nothing current builds on rustc 1.85); unit-tested |
-| `imu.rs` | **Pure** Mahony filter and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |
+| `imu.rs` | **Pure** Mahony filter (started level with the first sample's gravity; small `kp` on purpose, see its doc) and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |
 | `eis.rs` | **Pure** stabilizer: one- or two-stage (critically damped) smoothing, every stage clamped to what the zoom hides, `H = K_out · R · K⁻¹`; unit-tested |
 | `warp.rs` | **Pure** I420 bilinear inverse warp, row-parallel with rayon; unit-tested |
 | `warp_bridge.rs` | The raw appsink callback bridging the two stabilized pipelines (GStreamer glue around the pure modules) |

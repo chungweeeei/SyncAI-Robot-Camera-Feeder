@@ -125,8 +125,15 @@
     max_imu_wait_ms: 5.0
     # Multiplies linear_acceleration into m/s^2. Livox reports g; set 1.0 for an SI source.
     imu_accel_scale: 9.80665
-    # Accelerometer correction gain of the orientation filter (Mahony kp); 0 is gyro-only.
-    mahony_kp: 0.5
+    # Accelerometer correction gain of the orientation filter (Mahony kp); 0 is gyro-only. Small
+    # on purpose: the warp only uses the rotation between the real and the virtual camera, so the
+    # accelerometer is only there to bound slow gyro drift, and the correction low-passes its
+    # apparent tilt with a corner at kp/(2*pi) Hz — which a trot's fore-aft accelerations are, at
+    # the gait frequency. A 0.1 g surge at 2 Hz becomes ~0.23 deg (~3.5 px) of fake tilt in the
+    # image at 0.5 (the value until 2026-10-19) and ~0.02 deg at 0.05 — computed, not yet measured
+    # on a bag. The filter starts level with the first sample's gravity, so a small gain needs no
+    # settling time.
+    mahony_kp: 0.05
     # Who decodes and re-encodes the frames when stabilize is on (the passthrough decodes nothing).
     #   auto     - the Jetson's hardware JPEG (nvv4l2decoder ! nvvidconv, and nvjpegenc) when
     #              GStreamer has those elements, i.e. in a container under the nvidia runtime;

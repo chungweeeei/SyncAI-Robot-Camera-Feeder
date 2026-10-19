@@ -49,7 +49,8 @@ a pipeline error). Not yet run against the real camera on the robot.
   knob. Without IMU samples the frames pass through (zoomed, unwarped) and a throttled warning
   says so. The virtual camera follows the real one through two cascaded first-order low-pass
   stages (`smoothing_order`, `smoothing_time_constant_s`), which pass a third of the walking
-  shake one stage did.
+  shake one stage did; the orientation comes from a Mahony filter started level with gravity
+  whose accelerometer gain (`mahony_kp`) is kept small, so the gait's surge is not read as tilt.
 - **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
   pipeline clock (`src/camera_feeder_node/stamp.rs`); with stabilization on, the stamp computed
   on the capture pipeline travels to the output pipeline's appsink keyed by PTS. The rate limit

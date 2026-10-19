@@ -38,6 +38,13 @@ pub struct MahonyGains {
 /// The Mahony complementary filter (Mahony, Hamel, Pflimlin 2008), without a magnetometer:
 /// heading is gyro-only and drifts freely, which is fine for stabilization — the smoother follows
 /// the drift and only the *difference* between the raw and smoothed orientation reaches the image.
+///
+/// The same holds for tilt, so the accelerometer term is not there for an absolute horizon (the
+/// warp never uses one) but to keep slow gyro drift bounded, and its gain should be small. The
+/// correction low-passes the accelerometer's apparent tilt with a corner at `kp / 2π`, and a
+/// walking robot's fore-aft accelerations *are* apparent tilt at the gait frequency: 0.1 g at
+/// 2 Hz reads as 5.7°, of which kp 0.5 let 4 % (0.23°, ~3.5 px at the zoomed focal length) into
+/// the orientation — shake the stabilizer then added to the image. kp 0.05 lets 0.4 % in.
 #[derive(Clone, Debug)]
 pub struct Mahony {
     /// world_from_body.
@@ -65,6 +72,40 @@ impl Mahony {
     pub fn reset(&mut self) {
         self.q = Quat::IDENTITY;
         self.integral = [0.0; 3];
+    }
+
+    /// Starts over from one accelerometer reading: level with it (heading 0) when the filter uses
+    /// the accelerometer at all, at the identity when it is gyro-only (`kp` 0).
+    ///
+    /// Starting level matters because of the small `kp`: from the identity, kp 0.05 would close
+    /// the gap to the lidar's 16° mount tilt with a 20 s (1/kp) time constant, and the virtual
+    /// camera would drift along with it for the first minute.
+    pub fn restart(&mut self, accel: [f64; 3]) {
+        self.reset();
+        if self.gains.kp > 0.0 {
+            self.align_to_gravity(accel);
+        }
+    }
+
+    /// Sets the tilt so the body-frame "up" is the measured specific force, with heading 0. A
+    /// reading that cannot be normalized leaves the orientation alone.
+    pub fn align_to_gravity(&mut self, accel: [f64; 3]) {
+        let Some(up) = normalized(accel) else {
+            return;
+        };
+        // q (world_from_body) must take `up` onto world +z: the rotation about up × z by the angle
+        // between them. The axis is horizontal, so the heading stays 0.
+        let axis = [up[1], -up[0], 0.0];
+        let sin = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+        let cos = up[2];
+        self.q = if sin > 1e-12 {
+            Quat::from_axis_angle(axis, sin.atan2(cos))
+        } else if cos > 0.0 {
+            Quat::IDENTITY
+        } else {
+            // Upside down: any horizontal axis will do.
+            Quat::from_axis_angle([1.0, 0.0, 0.0], std::f64::consts::PI)
+        };
     }
 
     /// Advances the orientation by one sample of `dt_s` seconds. `accel` is the measured
@@ -163,9 +204,9 @@ impl ImuBuffer {
             Some(previous) => {
                 let gap = sample.stamp_ns - previous.stamp_ns;
                 if gap > RESET_GAP_NS {
-                    self.filter.reset();
+                    self.filter.restart(sample.accel_m_s2);
                     self.history.clear();
-                    // The first sample after a gap only sets the time base.
+                    // The first sample after a gap only sets the time base (and the tilt).
                     self.filter.orientation()
                 } else {
                     let dt_s = gap as f64 / 1e9;
@@ -173,7 +214,10 @@ impl ImuBuffer {
                         .update(sample.gyro_rad_s, Some(sample.accel_m_s2), dt_s)
                 }
             }
-            None => self.filter.orientation(),
+            None => {
+                self.filter.restart(sample.accel_m_s2);
+                self.filter.orientation()
+            }
         };
         if self.history.len() == self.capacity {
             self.history.pop_front();
@@ -385,6 +429,83 @@ mod tests {
             filter.update([0.0; 3], Some([9.81, 0.0, 0.0]), 0.005);
         }
         assert_eq!(filter.orientation(), Quat::IDENTITY);
+    }
+
+    /// What the Livox on robot01 reads standing still (g): the lidar is pitched ~16°.
+    const LIVOX_AT_REST: [f64; 3] = [-0.279, -0.019, 0.959];
+
+    fn up_in_body(q: Quat) -> [f64; 3] {
+        q.conjugate().rotate([0.0, 0.0, 1.0])
+    }
+
+    #[test]
+    fn aligning_to_gravity_levels_the_filter_with_the_accelerometer() {
+        let mut filter = Mahony::new(GAINS);
+        filter.align_to_gravity(LIVOX_AT_REST);
+        let a = normalized(LIVOX_AT_REST).unwrap();
+        let up = up_in_body(filter.orientation());
+        for i in 0..3 {
+            assert!((up[i] - a[i]).abs() < 1e-12, "{up:?} vs {a:?}");
+        }
+        assert!((filter.orientation().angle() - a[2].acos()).abs() < 1e-12);
+        // Heading 0: the tilt axis is horizontal.
+        assert!(filter.orientation().z.abs() < 1e-12);
+
+        filter.align_to_gravity([0.0, 0.0, -9.81]);
+        assert!((up_in_body(filter.orientation())[2] + 1.0).abs() < 1e-12);
+        filter.align_to_gravity([0.0, 0.0, 9.81]);
+        assert_eq!(filter.orientation(), Quat::IDENTITY);
+        // An unusable reading changes nothing.
+        filter.align_to_gravity([0.0; 3]);
+        assert_eq!(filter.orientation(), Quat::IDENTITY);
+    }
+
+    #[test]
+    fn the_first_sample_levels_the_filter_unless_it_is_gyro_only() {
+        let tilted = ImuSample {
+            stamp_ns: 0,
+            gyro_rad_s: [0.0; 3],
+            accel_m_s2: LIVOX_AT_REST,
+        };
+        let mut buffer = ImuBuffer::new(400, GAINS);
+        assert!(buffer.push(tilted));
+        let OrientationAt::Interpolated(q) = buffer.orientation_at(0) else {
+            panic!("the newest stamp is interpolated");
+        };
+        assert!((up_in_body(q)[0] - normalized(LIVOX_AT_REST).unwrap()[0]).abs() < 1e-12);
+
+        let mut buffer = ImuBuffer::new(400, GYRO_ONLY);
+        assert!(buffer.push(tilted));
+        assert_eq!(
+            buffer.orientation_at(0),
+            OrientationAt::Interpolated(Quat::IDENTITY)
+        );
+    }
+
+    /// The largest tilt error, in degrees, over the last 5 of 10 s of a body that stays level
+    /// (gyro silent) while it accelerates fore and aft at 1 m/s², 2 Hz: a trot's surge.
+    fn gait_tilt_error_deg(kp: f64) -> f64 {
+        let mut filter = Mahony::new(MahonyGains { kp, ki: 0.0 });
+        filter.align_to_gravity([0.0, 0.0, 9.81]);
+        let mut worst: f64 = 0.0;
+        for i in 0..2000 {
+            let t = f64::from(i) * 0.005;
+            let surge = (2.0 * std::f64::consts::PI * 2.0 * t).sin();
+            let q = filter.update([0.0; 3], Some([surge, 0.0, 9.81]), 0.005);
+            if i >= 1000 {
+                worst = worst.max(q.angle());
+            }
+        }
+        worst.to_degrees()
+    }
+
+    #[test]
+    fn a_small_gain_keeps_the_gait_out_of_the_tilt() {
+        // kp/ω of the 5.8° apparent tilt: 0.23° at kp 0.5, 0.023° at kp 0.05.
+        let old = gait_tilt_error_deg(0.5);
+        let new = gait_tilt_error_deg(0.05);
+        assert!(old > 0.15, "{old}");
+        assert!(new < 0.05, "{new}");
     }
 
     #[test]

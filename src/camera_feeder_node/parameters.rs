@@ -40,7 +40,9 @@ const MAX_ZOOM: f64 = 2.0;
 const DEFAULT_MAX_IMU_WAIT_MS: f64 = 5.0;
 const MAX_IMU_WAIT_MS: f64 = 50.0;
 const MAX_IMU_TIME_OFFSET_MS: f64 = 500.0;
-const DEFAULT_MAHONY_KP: f64 = 0.5;
+// Small on purpose: the warp only uses relative rotation, and a larger gain feeds the gait's
+// fore-aft accelerations into the tilt (0.5 let ~0.23° of a 2 Hz surge through; see imu::Mahony).
+const DEFAULT_MAHONY_KP: f64 = 0.05;
 const MAX_MAHONY_KP: f64 = 10.0;
 const DEFAULT_JPEG_CODEC: &str = "auto";
 
