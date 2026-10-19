@@ -82,7 +82,10 @@
     # against the yaw rate gives fx ~ 675 px, and a sweep of the other three minimised the
     # residual far-field shake. They are a working set, not a calibration: a checkerboard run
     # (camera_calibration on image_raw/compressed) should replace fx/fy/cx/cy, and the lens's
-    # barrel distortion is not modelled at all.
+    # barrel distortion is not modelled at all. `tools/eis_fit.py offset` on record/dp1f_with_image
+    # fits a scale of 1.08 to the gyro-predicted shift at the centre 80 % of the frame (fx ~726 px),
+    # possibly the distortion (the centre magnifies more than the average): one more reason for the
+    # checkerboard.
     fx: 675.0
     fy: 675.0
     cx: 0.0
@@ -101,12 +104,28 @@
     # Suspect until re-swept: that bag's frames went through videorate, which stamped each one
     # 0-16.7 ms early by an amount fixed for the recording and different on every start (see
     # rate_limit.rs). The +10 ms may be mostly that recording's offset rather than a latency; with
-    # the stamps now the capture's own it is probably too large. Fit it again on a bag recorded
-    # after 2026-10-16.
+    # the stamps now the capture's own it is probably too large. `tools/eis_fit.py offset` on
+    # record/dp1f_with_image (also videorate-stamped) finds +11 ms, flat to +-1 ms and the same in
+    # every 30 s window, so the true offset lies between about -6 and +11 ms. Fit it again with
+    # that tool on a bag recorded after 2026-10-16 17:50.
     imu_time_offset_ms: 10.0
-    # Time constant (s) of the low-pass the virtual camera follows the real one with. Larger is
-    # steadier and lags further behind real pans.
-    smoothing_time_constant_s: 0.5
+    # The low-pass the virtual camera follows the real one with: smoothing_order first-order
+    # stages, each with time constant smoothing_time_constant_s (s). What the image shows is the
+    # virtual camera's own motion, so the residual walking shake is the low-pass's gain at the
+    # gait frequency, 1/sqrt(1+(2*pi*f*tau)^2) per stage (robot01's pitch, the vertical image
+    # motion, is at 3.8 Hz), and a steady pan is followed order x tau behind. Replayed on
+    # record/dp1f_with_image (robot01, 2026-10-16, 784 s; `tools/eis_fit.py filters`), vertical
+    # gait-band (1-6 Hz) shake at the zoomed focal length, raw 6.30 px:
+    #                                 pan lag  outside clamped stretches  overall  clamped
+    #   1 x 0.5 s  (until 2026-10-19)  0.5 s    0.84 px (17 % of raw)      1.73 px  10.8 %
+    #   2 x 0.25 s                     0.5 s    0.66 px (14 %)             1.67 px  12.3 %
+    #   2 x 0.35 s                     0.7 s    0.51 px (10.5 %)           1.64 px  13.2 %
+    # The overall column barely moves because while the clamp holds the view (turns use up the
+    # zoom's margin) the real shake passes straight through, whatever the low-pass does. Two
+    # equal stages are critically damped: the view does not overshoot and swing back when a turn
+    # ends. 1 is the old single stage, for A/B comparison.
+    smoothing_order: 2
+    smoothing_time_constant_s: 0.35
     # Output magnification, 1.0 to 2.0: the border it crops is what hides the warp. 1.3 hides
     # about 7 degrees of correction at fx 675 (1.15 hid only 4, which the robot's 0.5 rad/s turns
     # exhausted); beyond that the correction is clamped rather than showing black.
@@ -116,8 +135,15 @@
     max_imu_wait_ms: 5.0
     # Multiplies linear_acceleration into m/s^2. Livox reports g; set 1.0 for an SI source.
     imu_accel_scale: 9.80665
-    # Accelerometer correction gain of the orientation filter (Mahony kp); 0 is gyro-only.
-    mahony_kp: 0.5
+    # Accelerometer correction gain of the orientation filter (Mahony kp); 0 is gyro-only. Small
+    # on purpose: the warp only uses the rotation between the real and the virtual camera, so the
+    # accelerometer is only there to bound slow gyro drift, and the correction low-passes its
+    # apparent tilt with a corner at kp/(2*pi) Hz — which a trot's fore-aft accelerations are, at
+    # the gait frequency. Replayed on record/dp1f_with_image, the accelerometer term added 2.0 px
+    # RMS of vertical gait-band shake at 0.5 (the value until 2026-10-19), as much as the low-pass
+    # left of the real shake, and 0.2 px at 0.05. The filter starts level with the first sample's
+    # gravity, so a small gain needs no settling time.
+    mahony_kp: 0.05
     # Who decodes and re-encodes the frames when stabilize is on (the passthrough decodes nothing).
     #   auto     - the Jetson's hardware JPEG (nvv4l2decoder ! nvvidconv, and nvjpegenc) when
     #              GStreamer has those elements, i.e. in a container under the nvidia runtime;

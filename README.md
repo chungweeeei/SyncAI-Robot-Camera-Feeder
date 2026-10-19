@@ -47,7 +47,13 @@ a pipeline error). Not yet run against the real camera on the robot.
   instead of ~53) and the CPU otherwise. It needs the
   camera intrinsics and the IMU-to-camera rotation calibrated; the parameters file explains each
   knob. Without IMU samples the frames pass through (zoomed, unwarped) and a throttled warning
-  says so.
+  says so. The virtual camera follows the real one through two cascaded first-order low-pass
+  stages (`smoothing_order`, `smoothing_time_constant_s`), which leave ~40 % less of the walking
+  shake than one stage did wherever turns have not used up the zoom's margin; the orientation
+  comes from a Mahony filter started level with gravity whose accelerometer gain (`mahony_kp`) is
+  kept small, so the gait's surge is not read as tilt.
+  `tools/eis_fit.py` fits `imu_time_offset_ms` and compares these settings offline, from a rosbag
+  (see CLAUDE.md).
 - **Stamps are capture time**, not arrival time: node clock now minus the frame's age on the
   pipeline clock (`src/camera_feeder_node/stamp.rs`); with stabilization on, the stamp computed
   on the capture pipeline travels to the output pipeline's appsink keyed by PTS. The rate limit

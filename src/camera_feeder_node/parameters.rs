@@ -2,7 +2,7 @@ use rclrs::*;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::eis::{EisConfig, Intrinsics};
+use super::eis::{EisConfig, Intrinsics, SmoothingOrder};
 use super::imu::MahonyGains;
 use super::math::Mat3;
 use super::pipeline::{
@@ -31,13 +31,20 @@ const DEFAULT_ACCEL_SCALE: f64 = 9.806_65;
 /// The TF rotation parent = IMU (REP-103 body: x forward, y left, z up), child = optical frame
 /// (x right, y down, z forward).
 const DEFAULT_IMU_TO_CAMERA_RPY_DEG: [f64; 3] = [-90.0, 0.0, -90.0];
-const DEFAULT_SMOOTHING_TAU_S: f64 = 0.5;
+// Per stage. Two stages at 0.35 s left 10.5 % of the vertical gait shake outside turns on the
+// dp1f_with_image bag and follow a steady pan 0.7 s behind; the single 0.5 s stage before them left
+// 17 % with 0.5 s of lag (see SmoothingOrder).
+const DEFAULT_SMOOTHING_TAU_S: f64 = 0.35;
+const DEFAULT_SMOOTHING_ORDER: i64 = 2;
 const DEFAULT_ZOOM: f64 = 1.15;
 const MAX_ZOOM: f64 = 2.0;
 const DEFAULT_MAX_IMU_WAIT_MS: f64 = 5.0;
 const MAX_IMU_WAIT_MS: f64 = 50.0;
 const MAX_IMU_TIME_OFFSET_MS: f64 = 500.0;
-const DEFAULT_MAHONY_KP: f64 = 0.5;
+// Small on purpose: the warp only uses relative rotation, and a larger gain feeds the gait's
+// fore-aft accelerations into the tilt (on the dp1f_with_image bag 0.5 added 2.0 px of vertical
+// gait-band shake, 0.05 0.2 px; see imu::Mahony).
+const DEFAULT_MAHONY_KP: f64 = 0.05;
 const MAX_MAHONY_KP: f64 = 10.0;
 const DEFAULT_JPEG_CODEC: &str = "auto";
 
@@ -223,7 +230,12 @@ impl Parameters {
         let smoothing_time_constant_s = real(
             "smoothing_time_constant_s",
             DEFAULT_SMOOTHING_TAU_S,
-            "low-pass time constant the virtual camera follows the real one with",
+            "time constant of each low-pass stage the virtual camera follows the real one with",
+        )?;
+        let smoothing_order = integer(
+            "smoothing_order",
+            DEFAULT_SMOOTHING_ORDER,
+            "low-pass stages the virtual camera follows the real one through: 1 or 2",
         )?;
         let zoom = real(
             "zoom",
@@ -304,6 +316,7 @@ impl Parameters {
                         DEFAULT_SMOOTHING_TAU_S,
                         &mut warn,
                     ),
+                    smoothing_order: smoothing_order_from(smoothing_order.get(), &mut warn),
                     cam_from_imu: cam_from_imu(&imu_to_camera_rpy_deg.get(), &mut warn),
                 },
                 frame_time_offset_ns: frame_time_offset_ns(offset_ms, exposure_value),
@@ -383,6 +396,7 @@ impl Parameters {
                     gain,
                     brightness,
                     power_line_frequency,
+                    smoothing_order,
                 ],
                 _real: vec![
                     fx,
@@ -451,6 +465,20 @@ fn cam_from_imu(rpy_deg: &[f64], warn: &mut impl FnMut(String)) -> Mat3 {
         }
     };
     Mat3::from_rpy_deg(roll, pitch, yaw).transpose()
+}
+
+/// 1 or 2 stages; anything else falls back to the default with a warning.
+fn smoothing_order_from(value: i64, warn: &mut impl FnMut(String)) -> SmoothingOrder {
+    match value {
+        1 => SmoothingOrder::First,
+        2 => SmoothingOrder::Second,
+        other => {
+            warn(format!(
+                "smoothing_order={other} is not 1 or 2; using {DEFAULT_SMOOTHING_ORDER}"
+            ));
+            smoothing_order_from(DEFAULT_SMOOTHING_ORDER, warn)
+        }
+    }
 }
 
 /// The capture stamp marks the start of exposure; the orientation that shaped the frame is the
@@ -787,6 +815,23 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("jpeg_codec"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn the_smoothing_order_is_one_or_two_stages() {
+        assert_eq!(smoothing_order_from(1, &mut ignore), SmoothingOrder::First);
+        assert_eq!(smoothing_order_from(2, &mut ignore), SmoothingOrder::Second);
+        let mut warnings = Vec::new();
+        assert_eq!(
+            smoothing_order_from(3, &mut |m| warnings.push(m)),
+            SmoothingOrder::Second
+        );
+        assert_eq!(
+            smoothing_order_from(0, &mut |m| warnings.push(m)),
+            SmoothingOrder::Second
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("smoothing_order"), "{}", warnings[0]);
     }
 
     #[test]

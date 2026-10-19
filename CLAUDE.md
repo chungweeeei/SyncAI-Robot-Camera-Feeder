@@ -85,8 +85,8 @@ container whose device is missing).
 | `camera_info.rs` | **Pure** parser / validator of `camera_calibration`'s `ost.yaml` for `camera_info`; rejects rather than publishes a wrong calibration (another resolution, short matrices, unknown model); unit-tested |
 | `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
 | `math.rs` | **Pure** `Quat` / `Mat3` (no nalgebra: nothing current builds on rustc 1.85); unit-tested |
-| `imu.rs` | **Pure** Mahony filter and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |
-| `eis.rs` | **Pure** stabilizer: smoothing, clamp to what the zoom hides, `H = K_out · R · K⁻¹`; unit-tested |
+| `imu.rs` | **Pure** Mahony filter (started level with the first sample's gravity; small `kp` on purpose, see its doc) and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |
+| `eis.rs` | **Pure** stabilizer: one- or two-stage (critically damped) smoothing, every stage clamped to what the zoom hides, `H = K_out · R · K⁻¹`; unit-tested |
 | `warp.rs` | **Pure** I420 bilinear inverse warp, row-parallel with rayon; unit-tested |
 | `warp_bridge.rs` | The raw appsink callback bridging the two stabilized pipelines (GStreamer glue around the pure modules) |
 
@@ -178,6 +178,22 @@ nothing measurable (~3.2–3.3 cores either way). Four things the chain depends 
 The first frame after a start is ~370 ms old at the warp while the decoder initialises; it is
 steady from the next stats line on. The warp itself stays on the CPU (rayon); the GPU path for it
 would be VPI, which is not a GStreamer element. Transcoding for WebRTC stays in the worker.
+
+## Tuning the stabilization (`tools/eis_fit.py`)
+
+An offline Python tool, not part of the package build and not run by CI. It needs `rosbag2_py`,
+OpenCV and NumPy, which the robot container has (the Dev Container and the host do not), so run it
+there on a bag under the Workspace (`~/robot_ws/record/<bag>`), without `python3 -I`, which drops
+the ROS `PYTHONPATH`:
+
+- `filters BAG`: IMU only. Replays `imu.rs` / `eis.rs` over the bag's IMU at the frame rate and
+  prints the gait-band (1-6 Hz) shake each smoothing setting leaves and each Mahony gain injects.
+- `offset BAG`: fits `imu_time_offset_ms` from raw frames (stabilize off) against the gyro. The
+  frames' stamps must be the capture's own, i.e. recorded after 2026-10-16 17:50 (`ece6437`).
+- `residual BAG [--stabilized]`: the gait-band shake measured in a recording's frames, for an A/B.
+
+Its orientation filter and low-pass mirror `imu.rs` and `eis.rs` line for line, and it reads the
+params file the way `parameters.rs` does: change them together.
 
 ## GStreamer version pin
 
