@@ -2,7 +2,7 @@ use rclrs::*;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::eis::{EisConfig, Intrinsics, SmoothingOrder};
+use super::eis::{EisConfig, Intrinsics, SmoothingOrder, TurnDamping};
 use super::imu::MahonyGains;
 use super::math::Mat3;
 use super::pipeline::{
@@ -36,6 +36,14 @@ const DEFAULT_IMU_TO_CAMERA_RPY_DEG: [f64; 3] = [-90.0, 0.0, -90.0];
 // 17 % with 0.5 s of lag (see SmoothingOrder).
 const DEFAULT_SMOOTHING_TAU_S: f64 = 0.35;
 const DEFAULT_SMOOTHING_ORDER: i64 = 2;
+// Turn damping (see eis::TurnDamping). Replayed on the dp1f_with_image bag with `tools/eis_fit.py
+// filters`, reference 0.15 left 0.4 deg of the 5.6 deg the view slid on after a 0.5 rad/s turn,
+// for 1.28 px of vertical gait shake walking straight instead of 0.89. A reference of 0 turns it
+// off.
+const DEFAULT_TURN_RATE_TAU_S: f64 = 0.3;
+const DEFAULT_TURN_DEADBAND_RAD_S: f64 = 0.1;
+const DEFAULT_TURN_REFERENCE_RAD_S: f64 = 0.15;
+const MAX_TURN_RATE_RAD_S: f64 = 10.0;
 const DEFAULT_ZOOM: f64 = 1.15;
 const MAX_ZOOM: f64 = 2.0;
 const DEFAULT_MAX_IMU_WAIT_MS: f64 = 5.0;
@@ -237,6 +245,21 @@ impl Parameters {
             DEFAULT_SMOOTHING_ORDER,
             "low-pass stages the virtual camera follows the real one through: 1 or 2",
         )?;
+        let turn_rate_time_constant_s = real(
+            "turn_rate_time_constant_s",
+            DEFAULT_TURN_RATE_TAU_S,
+            "time constant of each of the two low-pass stages the heading rate is read through",
+        )?;
+        let turn_damping_deadband_rad_s = real(
+            "turn_damping_deadband_rad_s",
+            DEFAULT_TURN_DEADBAND_RAD_S,
+            "turn rate below which the smoothing is not shortened",
+        )?;
+        let turn_damping_reference_rad_s = real(
+            "turn_damping_reference_rad_s",
+            DEFAULT_TURN_REFERENCE_RAD_S,
+            "turn rate above the deadband at which the smoothing time constant is halved; 0 = off",
+        )?;
         let zoom = real(
             "zoom",
             DEFAULT_ZOOM,
@@ -317,6 +340,14 @@ impl Parameters {
                         &mut warn,
                     ),
                     smoothing_order: smoothing_order_from(smoothing_order.get(), &mut warn),
+                    turn_damping: turn_damping(
+                        [
+                            turn_rate_time_constant_s.get(),
+                            turn_damping_deadband_rad_s.get(),
+                            turn_damping_reference_rad_s.get(),
+                        ],
+                        &mut warn,
+                    ),
                     cam_from_imu: cam_from_imu(&imu_to_camera_rpy_deg.get(), &mut warn),
                 },
                 frame_time_offset_ns: frame_time_offset_ns(offset_ms, exposure_value),
@@ -405,6 +436,9 @@ impl Parameters {
                     cy,
                     imu_time_offset_ms,
                     smoothing_time_constant_s,
+                    turn_rate_time_constant_s,
+                    turn_damping_deadband_rad_s,
+                    turn_damping_reference_rad_s,
                     zoom,
                     max_imu_wait_ms,
                     imu_accel_scale,
@@ -468,6 +502,38 @@ fn cam_from_imu(rpy_deg: &[f64], warn: &mut impl FnMut(String)) -> Mat3 {
 }
 
 /// 1 or 2 stages; anything else falls back to the default with a warning.
+/// `[rate τ, deadband, reference]`; a reference of 0 is no damping.
+fn turn_damping(
+    [rate_tau_s, deadband_rad_s, reference_rad_s]: [f64; 3],
+    warn: &mut impl FnMut(String),
+) -> Option<TurnDamping> {
+    let reference_rad_s = bounded(
+        "turn_damping_reference_rad_s",
+        reference_rad_s,
+        0.0,
+        MAX_TURN_RATE_RAD_S,
+        DEFAULT_TURN_REFERENCE_RAD_S,
+        warn,
+    );
+    (reference_rad_s > 0.0).then(|| TurnDamping {
+        rate_tau_s: positive_real(
+            "turn_rate_time_constant_s",
+            rate_tau_s,
+            DEFAULT_TURN_RATE_TAU_S,
+            warn,
+        ),
+        deadband_rad_s: bounded(
+            "turn_damping_deadband_rad_s",
+            deadband_rad_s,
+            0.0,
+            MAX_TURN_RATE_RAD_S,
+            DEFAULT_TURN_DEADBAND_RAD_S,
+            warn,
+        ),
+        reference_rad_s,
+    })
+}
+
 fn smoothing_order_from(value: i64, warn: &mut impl FnMut(String)) -> SmoothingOrder {
     match value {
         1 => SmoothingOrder::First,
@@ -815,6 +881,30 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("jpeg_codec"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn a_zero_turn_reference_turns_the_damping_off_and_bad_values_fall_back() {
+        assert_eq!(turn_damping([0.3, 0.1, 0.0], &mut ignore), None);
+        assert_eq!(
+            turn_damping([0.3, 0.1, 0.15], &mut ignore),
+            Some(TurnDamping {
+                rate_tau_s: 0.3,
+                deadband_rad_s: 0.1,
+                reference_rad_s: 0.15,
+            })
+        );
+        let mut warnings = Vec::new();
+        let damping = turn_damping([-1.0, f64::NAN, -2.0], &mut |m| warnings.push(m));
+        assert_eq!(
+            damping,
+            Some(TurnDamping {
+                rate_tau_s: DEFAULT_TURN_RATE_TAU_S,
+                deadband_rad_s: DEFAULT_TURN_DEADBAND_RAD_S,
+                reference_rad_s: DEFAULT_TURN_REFERENCE_RAD_S,
+            })
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
     }
 
     #[test]

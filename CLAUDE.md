@@ -86,7 +86,7 @@ container whose device is missing).
 | `bus.rs` | Bus watch thread: WARNING → throttled log; ERROR / EOS → NULL, `exit(1)` for `respawn` |
 | `math.rs` | **Pure** `Quat` / `Mat3` (no nalgebra: nothing current builds on rustc 1.85); unit-tested |
 | `imu.rs` | **Pure** Mahony filter (started level with the first sample's gravity; small `kp` on purpose, see its doc) and the orientation history (`ImuBuffer`, interpolate / extrapolate / stale); unit-tested |
-| `eis.rs` | **Pure** stabilizer: one- or two-stage (critically damped) smoothing, every stage clamped to what the zoom hides, `H = K_out · R · K⁻¹`; unit-tested |
+| `eis.rs` | **Pure** stabilizer: one- or two-stage (critically damped) smoothing, shortened while the robot turns (`TurnDamping`), every stage clamped to what the zoom hides and the output fitted so no corner leaves the frame, `H = K_out · R · K⁻¹`; unit-tested |
 | `warp.rs` | **Pure** I420 bilinear inverse warp, row-parallel with rayon; unit-tested |
 | `warp_bridge.rs` | The raw appsink callback bridging the two stabilized pipelines (GStreamer glue around the pure modules) |
 
@@ -182,12 +182,15 @@ would be VPI, which is not a GStreamer element. Transcoding for WebRTC stays in 
 ## Tuning the stabilization (`tools/eis_fit.py`)
 
 An offline Python tool, not part of the package build and not run by CI. It needs `rosbag2_py`,
-OpenCV and NumPy, which the robot container has (the Dev Container and the host do not), so run it
-there on a bag under the Workspace (`~/robot_ws/record/<bag>`), without `python3 -I`, which drops
+OpenCV and NumPy, which the robot container and the Dev Container image have (the host does not),
+so run it there on a bag under the Workspace (`~/robot_ws/record/<bag>`), without `python3 -I`, which drops
 the ROS `PYTHONPATH`:
 
 - `filters BAG`: IMU only. Replays `imu.rs` / `eis.rs` over the bag's IMU at the frame rate and
-  prints the gait-band (1-6 Hz) shake each smoothing setting leaves and each Mahony gain injects.
+  prints, per smoothing setting (`ORDER:TAU[:TURN_REF]`), the gait-band (1-6 Hz) shake it leaves
+  walking straight and turning, how far the view trails a turn and slides after one, and what each
+  Mahony gain injects. A zstd-compressed bag cannot be read from a read-only mount (rosbag2
+  decompresses next to it); decompress a copy first.
 - `offset BAG`: fits `imu_time_offset_ms` from raw frames (stabilize off) against the gyro. The
   frames' stamps must be the capture's own, i.e. recorded after 2026-10-16 17:50 (`ece6437`).
 - `residual BAG [--stabilized]`: the gait-band shake measured in a recording's frames, for an A/B.

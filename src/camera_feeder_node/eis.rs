@@ -9,6 +9,10 @@
 //! `K` the intrinsics, `R` the real-to-virtual rotation in the optical frame, and `K_out` the
 //! intrinsics scaled by the zoom that hides the borders the warp uncovers.
 //!
+//! While the robot turns, the low-pass is shortened ([`TurnDamping`]): a turn is motion the
+//! viewer means to see, and a view that trails it slides on for a second after the robot has
+//! stopped.
+//!
 //! Pure: no GStreamer or ROS types; everything is tested on synthetic orientations.
 
 use super::math::{Mat3, Quat};
@@ -84,13 +88,53 @@ impl SmoothingOrder {
     }
 }
 
+/// Shortens the virtual camera's low-pass while the robot turns.
+///
+/// A plain low-pass follows a steady turn `stages × τ` behind, which at robot01's 0.5 rad/s is
+/// 20°, so every turn ran the view into the clamp (what the zoom hides, ~6°) and held it there;
+/// when the turn ended, the view slid the last 6° after a robot that had already stopped, for
+/// ~1.5 s at 2 × 0.35 s. Operators saw that as an image that kept flowing after the turn. Here
+/// each stage's τ is divided by `1 + (excess / reference)²`, where `excess` is how far the turn
+/// rate is above `deadband_rad_s`, so the view keeps up with a turn and has little left to catch
+/// up when it ends.
+///
+/// The turn rate is the heading's (rotation about world z, see [`heading`]) through two
+/// first-order stages of `rate_tau_s`, because the gait sways the heading too: on robot01 at
+/// 1.9 Hz and up to ~0.4 rad/s, which unfiltered would shorten τ at every step and let the sway
+/// through. The deadband keeps what the low-pass leaves of the sway (and slow drift) from
+/// shortening τ while walking straight. Shortening τ costs little in a turn anyway: there the
+/// clamp used to hold the view, and the real camera's shake went straight through it.
+///
+/// Every stage stays a first-order low-pass, only with a varying τ, so a turn's end is still
+/// approached without overshoot. A feed-forward of the turn rate (zero lag in a steady turn) was
+/// tried and rejected: it overshot every turn's end by 5-7°, the swing back being worse than the
+/// slide.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurnDamping {
+    /// Time constant of each of the two stages the heading rate is low-passed through.
+    pub rate_tau_s: f64,
+    /// Turn rates up to this leave the smoothing alone.
+    pub deadband_rad_s: f64,
+    /// The excess over the deadband at which τ is halved; > 0.
+    pub reference_rad_s: f64,
+}
+
+impl TurnDamping {
+    /// The per-stage time constant to use at `turn_rate` (rad/s, either sign).
+    #[must_use]
+    pub fn effective_tau(&self, tau_s: f64, turn_rate: f64) -> f64 {
+        let excess = (turn_rate.abs() - self.deadband_rad_s).max(0.0) / self.reference_rad_s;
+        tau_s / (1.0 + excess * excess)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EisConfig {
     pub intrinsics: Intrinsics,
     pub width: u32,
     pub height: u32,
     /// Output magnification, >= 1. The warp uncovers a border of up to
-    /// `(1 - 1/zoom)` of each half-size; see [`max_hidden_angle`].
+    /// `(1 - 1/zoom)` of each half-size; see [`hidden_angles`].
     pub zoom: f64,
     /// Time constant of each first-order stage of the low-pass that the virtual camera follows
     /// the real one with. Larger is steadier, and drifts further from the real framing: a steady
@@ -98,40 +142,55 @@ pub struct EisConfig {
     pub smoothing_tau_s: f64,
     /// How many such stages; see [`SmoothingOrder`].
     pub smoothing_order: SmoothingOrder,
+    /// `None` smooths turns like any other motion.
+    pub turn_damping: Option<TurnDamping>,
     /// The rotation taking IMU-frame vectors into the camera optical frame.
     pub cam_from_imu: Mat3,
+}
+
+/// What the stabilizer carries from one frame to the next.
+#[derive(Clone, Copy, Debug)]
+struct State {
+    stamp_ns: i64,
+    /// The output of each low-pass stage, in the IMU frame. The last stage is `q_s` (before the
+    /// fit to the frame); with [`SmoothingOrder::First`] both hold the same value.
+    stages: [Quat; 2],
+    /// The real camera's heading, for the next frame's turn rate.
+    heading: f64,
+    /// The heading rate (rad/s) after each of [`TurnDamping`]'s two low-pass stages.
+    turn_rate: [f64; 2],
 }
 
 /// The per-frame state of the stabilizer: the virtual camera's orientation.
 #[derive(Clone, Debug)]
 pub struct Stabilizer {
     config: EisConfig,
-    /// The stamp of the previous frame and the output of each low-pass stage there, in the IMU
-    /// frame. The last stage is `q_s`; with [`SmoothingOrder::First`] both hold the same value.
-    smoothed: Option<(i64, [Quat; 2])>,
+    state: Option<State>,
     max_angle: f64,
     k_out: Intrinsics,
 }
+
+/// Bisection steps of [`Stabilizer::fit_to_frame`]: 2⁻²⁰ of the correction, far below a pixel.
+const FIT_ITERATIONS: u32 = 20;
 
 impl Stabilizer {
     #[must_use]
     pub fn new(config: EisConfig) -> Self {
         Self {
-            max_angle: max_hidden_angle(
-                &config.intrinsics,
-                config.zoom,
-                config.width,
-                config.height,
-            ),
+            max_angle: {
+                let (pan, tilt) =
+                    hidden_angles(&config.intrinsics, config.zoom, config.width, config.height);
+                pan.min(tilt)
+            },
             k_out: config.intrinsics.zoomed(config.zoom),
             config,
-            smoothed: None,
+            state: None,
         }
     }
 
     /// Forgets the virtual camera, so the next frame starts it at the real orientation again.
     pub fn reset(&mut self) {
-        self.smoothed = None;
+        self.state = None;
     }
 
     #[must_use]
@@ -143,11 +202,34 @@ impl Stabilizer {
     /// `q_imu` (world_from_imu) at the frame's capture time `stamp_ns`. Advances the virtual
     /// camera, so it is called once per frame, in order.
     pub fn correction(&mut self, stamp_ns: i64, q_imu: Quat) -> Mat3 {
-        let stages = match self.smoothed {
-            None => [q_imu; 2],
-            Some((previous_stamp, [first, second])) => {
-                let dt_s = (stamp_ns - previous_stamp).max(0) as f64 / 1e9;
-                let tau_s = self.config.smoothing_tau_s;
+        let heading_now = heading(q_imu);
+        let state = match self.state {
+            None => State {
+                stamp_ns,
+                stages: [q_imu; 2],
+                heading: heading_now,
+                turn_rate: [0.0; 2],
+            },
+            Some(previous) => {
+                let dt_s = (stamp_ns - previous.stamp_ns).max(0) as f64 / 1e9;
+                let turn_rate = match self.config.turn_damping {
+                    Some(damping) if dt_s > 0.0 => {
+                        let rate = wrap_angle(heading_now - previous.heading) / dt_s;
+                        let first = low_pass(previous.turn_rate[0], rate, dt_s, damping.rate_tau_s);
+                        [
+                            first,
+                            low_pass(previous.turn_rate[1], first, dt_s, damping.rate_tau_s),
+                        ]
+                    }
+                    _ => previous.turn_rate,
+                };
+                let tau_s = match self.config.turn_damping {
+                    Some(damping) => {
+                        damping.effective_tau(self.config.smoothing_tau_s, turn_rate[1])
+                    }
+                    None => self.config.smoothing_tau_s,
+                };
+                let [first, second] = previous.stages;
                 // Every stage is clamped toward the real orientation, not only the output: an
                 // unclamped first stage winds up during a long turn (it lags rate × τ, past what
                 // the zoom hides) and then holds the output at the clamp after the turn has ended.
@@ -158,18 +240,72 @@ impl Stabilizer {
                         clamp_toward(smooth(second, first, dt_s, tau_s), q_imu, self.max_angle)
                     }
                 };
-                [first, second]
+                State {
+                    stamp_ns,
+                    stages: [first, second],
+                    heading: heading_now,
+                    turn_rate,
+                }
             }
         };
-        self.smoothed = Some((stamp_ns, stages));
-        let q_s = stages[1];
+        self.state = Some(state);
+        let q_s = self.fit_to_frame(state.stages[1], q_imu);
+        homography(
+            &self.config.intrinsics,
+            &self.k_out,
+            &self.optical_rotation(q_s, q_imu),
+        )
+    }
 
-        // A world direction seen by the real camera is `C · R_imuᵀ · d`, by the virtual one
-        // `C · R_sᵀ · d`; the rotation from real to virtual is therefore `C · R_sᵀ · R_imu · Cᵀ`.
+    /// The rotation from the real camera (`q_imu`) to the virtual one (`q_s`), in the optical
+    /// frame. A world direction seen by the real camera is `C · R_imuᵀ · d`, by the virtual one
+    /// `C · R_sᵀ · d`; the rotation from real to virtual is therefore `C · R_sᵀ · R_imu · Cᵀ`.
+    fn optical_rotation(&self, q_s: Quat, q_imu: Quat) -> Mat3 {
         let c = &self.config.cam_from_imu;
-        let real_to_virtual = (q_s.conjugate() * q_imu).to_matrix();
-        let r = *c * real_to_virtual * c.transpose();
-        homography(&self.config.intrinsics, &self.k_out, &r)
+        *c * (q_s.conjugate() * q_imu).to_matrix() * c.transpose()
+    }
+
+    /// Whether every output pixel samples inside the frame when the virtual camera is `q_s`:
+    /// the four corner pixels' centres land inside the frame's (the warp's own bounds), and since
+    /// a homography in front of the camera maps the output rectangle onto a convex quadrilateral,
+    /// so does everything between them.
+    fn covers(&self, q_s: Quat, q_imu: Quat) -> bool {
+        let r = self.optical_rotation(q_s, q_imu);
+        // H⁻¹ = K · Rᵀ · K_out⁻¹.
+        let inverse = self.config.intrinsics.matrix() * r.transpose() * self.k_out.inverse();
+        let (right, bottom) = (
+            f64::from(self.config.width) - 0.5,
+            f64::from(self.config.height) - 0.5,
+        );
+        [(0.5, 0.5), (right, 0.5), (0.5, bottom), (right, bottom)]
+            .iter()
+            .all(|&(u, v)| {
+                let [x, y, w] = inverse.mul_vec([u, v, 1.0]);
+                w > 0.0
+                    && (0.5 - 1e-9..=right + 1e-9).contains(&(x / w))
+                    && (0.5 - 1e-9..=bottom + 1e-9).contains(&(y / w))
+            })
+    }
+
+    /// `q_s`, or the nearest orientation toward `q_imu` that leaves no border in the output.
+    ///
+    /// The per-stage clamp is an angle, measured at the edges' midpoints ([`hidden_angles`]); a
+    /// rotation about a diagonal, or a roll, uncovers a corner first, and the warp would fill it
+    /// black. `q_imu` itself always covers (zoom >= 1), so the bisection has an answer.
+    fn fit_to_frame(&self, q_s: Quat, q_imu: Quat) -> Quat {
+        if self.covers(q_s, q_imu) {
+            return q_s;
+        }
+        let (mut low, mut high) = (0.0, 1.0);
+        for _ in 0..FIT_ITERATIONS {
+            let mid = 0.5 * (low + high);
+            if self.covers(q_s.slerp(q_imu, mid), q_imu) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        q_s.slerp(q_imu, high)
     }
 
     /// The homography for a frame with no orientation: the zoom alone, so the framing does not
@@ -186,14 +322,57 @@ pub fn homography(k_in: &Intrinsics, k_out: &Intrinsics, r: &Mat3) -> Mat3 {
     k_out.matrix() * *r * k_in.inverse()
 }
 
-/// The largest rotation, in radians, that the border uncovered by `zoom` can hide: the smaller
-/// of the horizontal and vertical margins, as an angle at the focal length.
+/// The largest pan and tilt, in radians, that the border uncovered by `zoom` can hide.
+///
+/// Measured where the output's edge is, not at its centre: the output edge sits at
+/// `atan(half / (f · zoom))` off the axis and the frame's at `atan(half / f)`, and the difference
+/// is what a rotation may use. Until 2026-10-20 this was the margin's angle at the centre,
+/// `atan(half · (1 - 1/zoom) / f)`, which at fx 675 and zoom 1.3 allowed 7.0° of tilt where
+/// 5.8° fit, and a clamped tilt showed a black band at the top or bottom edge.
 #[must_use]
-pub fn max_hidden_angle(intrinsics: &Intrinsics, zoom: f64, width: u32, height: u32) -> f64 {
-    let margin = |half_size: f64| half_size * (1.0 - 1.0 / zoom.max(1.0));
-    let horizontal = (margin(f64::from(width) / 2.0) / intrinsics.fx).atan();
-    let vertical = (margin(f64::from(height) / 2.0) / intrinsics.fy).atan();
-    horizontal.min(vertical)
+pub fn hidden_angles(intrinsics: &Intrinsics, zoom: f64, width: u32, height: u32) -> (f64, f64) {
+    let zoom = zoom.max(1.0);
+    let hidden = |near: f64, far: f64, f: f64| {
+        let one_side = |half: f64| (half / f).atan() - (half / (f * zoom)).atan();
+        one_side(near).min(one_side(far))
+    };
+    (
+        hidden(
+            intrinsics.cx,
+            f64::from(width) - intrinsics.cx,
+            intrinsics.fx,
+        ),
+        hidden(
+            intrinsics.cy,
+            f64::from(height) - intrinsics.cy,
+            intrinsics.fy,
+        ),
+    )
+}
+
+/// The heading of a world_from_body orientation: its rotation about world z (the yaw of a
+/// z-y-x decomposition). The IMU filter starts level with gravity, so world z is up and this is
+/// the robot's turning; with a gyro-only filter (`mahony_kp` 0) it is about the IMU's first z,
+/// tilted by the mount.
+#[must_use]
+pub fn heading(q: Quat) -> f64 {
+    (2.0 * (q.w * q.z + q.x * q.y)).atan2(1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+}
+
+/// `a` wrapped into `-π..=π`.
+#[must_use]
+pub fn wrap_angle(a: f64) -> f64 {
+    let tau = std::f64::consts::TAU;
+    a - tau * (a / tau).round()
+}
+
+/// One step of a first-order low-pass on a scalar, as [`smooth`] is on orientations.
+#[must_use]
+pub fn low_pass(prev: f64, current: f64, dt_s: f64, tau_s: f64) -> f64 {
+    if tau_s <= 0.0 {
+        return current;
+    }
+    prev + (current - prev) * (1.0 - (-dt_s / tau_s).exp())
 }
 
 /// One step of a first-order low-pass on orientations: `prev` moves toward `current` by the
@@ -236,14 +415,21 @@ mod tests {
             zoom: 1.15,
             smoothing_tau_s: 0.5,
             smoothing_order: SmoothingOrder::First,
+            turn_damping: None,
             cam_from_imu: Mat3::IDENTITY,
         }
     }
 
+    const DAMPING: TurnDamping = TurnDamping {
+        rate_tau_s: 0.3,
+        deadband_rad_s: 0.1,
+        reference_rad_s: 0.15,
+    };
+
     impl Stabilizer {
         /// `q_s` after the last frame.
         fn virtual_camera(&self) -> Quat {
-            self.smoothed.expect("a frame has been corrected").1[1]
+            self.state.expect("a frame has been corrected").stages[1]
         }
     }
 
@@ -336,12 +522,13 @@ mod tests {
     #[test]
     fn the_correction_never_exceeds_what_the_zoom_can_hide() {
         let cfg = config();
-        let max = max_hidden_angle(&K, cfg.zoom, cfg.width, cfg.height);
-        // Vertical margin: 360 * (1 - 1/1.15) = 46.96 px -> atan(46.96/640) = 0.0733 rad.
-        assert!(
-            (max - (46.956_521_739 / 640.0f64).atan()).abs() < 1e-6,
-            "{max}"
-        );
+        let (pan, tilt) = hidden_angles(&K, cfg.zoom, cfg.width, cfg.height);
+        let max = pan.min(tilt);
+        // Vertical, at the edge: atan(360/640) - atan(360/(640 * 1.15)) = 0.0627 rad; the margin
+        // at the centre, atan(46.96/640) = 0.0733 rad, was more than the edge can hide.
+        let expected = (360.0f64 / 640.0).atan() - (360.0f64 / 736.0).atan();
+        assert!((tilt - expected).abs() < 1e-9, "{tilt}");
+        assert!(pan > tilt, "{pan} {tilt}");
 
         for order in [SmoothingOrder::First, SmoothingOrder::Second] {
             let mut s = Stabilizer::new(EisConfig {
@@ -486,7 +673,166 @@ mod tests {
                 assert!((h.0[i][j] - p.0[i][j]).abs() < 1e-9);
             }
         }
-        assert_eq!(s.smoothed.unwrap().1, [q; 2]);
+        assert_eq!(s.state.unwrap().stages, [q; 2]);
+    }
+
+    /// The output pixel centres of the frame's four corners, through the inverse of `h`.
+    fn corners_in_source(h: &Mat3) -> [(f64, f64); 4] {
+        let inverse = h.inverse().expect("invertible");
+        [(0.5, 0.5), (1279.5, 0.5), (0.5, 719.5), (1279.5, 719.5)].map(|(u, v)| map(&inverse, u, v))
+    }
+
+    #[test]
+    fn no_output_pixel_is_ever_left_outside_the_frame() {
+        // Rotations about diagonals and the optical axis reach a corner before an edge's midpoint,
+        // which is all the angle clamp measures.
+        for axis in [
+            [1.0, 1.0, 0.0],
+            [1.0, -1.0, 0.3],
+            [0.0, 0.0, 1.0],
+            [0.2, 0.9, 0.5],
+        ] {
+            for order in [SmoothingOrder::First, SmoothingOrder::Second] {
+                let mut s = Stabilizer::new(EisConfig {
+                    smoothing_order: order,
+                    ..config()
+                });
+                s.correction(0, Quat::IDENTITY);
+                for (i, degrees) in [3.0, 6.0, 10.0, 20.0].into_iter().enumerate() {
+                    let q = Quat::from_axis_angle(axis, f64::to_radians(degrees));
+                    let h = s.correction(i64::try_from(i + 1).unwrap(), q);
+                    for (x, y) in corners_in_source(&h) {
+                        assert!(
+                            (0.5 - 1e-6..=1279.5 + 1e-6).contains(&x)
+                                && (0.5 - 1e-6..=719.5 + 1e-6).contains(&y),
+                            "{axis:?} {degrees} deg: corner at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_correction_that_fits_is_not_touched_by_the_fit() {
+        let mut s = Stabilizer::new(EisConfig {
+            zoom: 2.0,
+            ..config()
+        });
+        s.correction(0, Quat::IDENTITY);
+        let q = Quat::from_axis_angle([1.0, 1.0, 0.0], 0.01);
+        s.correction(1, q);
+        let q_s = s.virtual_camera();
+        assert_eq!(s.fit_to_frame(q_s, q), q_s);
+    }
+
+    #[test]
+    fn turn_damping_leaves_slow_rates_alone_and_halves_tau_at_the_reference() {
+        assert_eq!(DAMPING.effective_tau(0.35, 0.0), 0.35);
+        assert_eq!(DAMPING.effective_tau(0.35, -0.1), 0.35);
+        assert!((DAMPING.effective_tau(0.35, 0.25) - 0.175).abs() < 1e-12);
+        assert!((DAMPING.effective_tau(0.35, -0.25) - 0.175).abs() < 1e-12);
+        assert!(DAMPING.effective_tau(0.35, 0.5) < 0.05);
+    }
+
+    /// The virtual camera's heading through a turn about world z at `rate` rad/s for 3 s (ramped
+    /// over 0.3 s at both ends), then 3 s standing, at 30 fps: (real, virtual) per frame.
+    fn turn(damping: Option<TurnDamping>, rate: f64) -> Vec<(f64, f64)> {
+        let mut s = Stabilizer::new(EisConfig {
+            zoom: 1.3,
+            smoothing_tau_s: 0.35,
+            smoothing_order: SmoothingOrder::Second,
+            turn_damping: damping,
+            // A REP-103 body, so a turn about its z pans the image rather than rolling it.
+            cam_from_imu: Mat3::from_rpy_deg(-90.0, 0.0, -90.0).transpose(),
+            ..config()
+        });
+        let mut angle = 0.0;
+        (0..180)
+            .map(|i| {
+                let t = f64::from(i) / 30.0;
+                let ramp = (t / 0.3).min((3.0 - t) / 0.3).clamp(0.0, 1.0);
+                angle += rate * ramp / 30.0;
+                s.correction(
+                    i64::from(i) * 33_333_333,
+                    Quat::from_axis_angle([0.0, 0.0, 1.0], angle),
+                );
+                (angle, heading(s.virtual_camera()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_turn_damping_the_view_stops_with_the_robot() {
+        let travel_after_stop = |damping| {
+            let headings = turn(damping, 0.5);
+            let at_stop = headings[90].1;
+            headings[90..]
+                .iter()
+                .map(|(_, v)| (v - at_stop).abs())
+                .fold(0.0, f64::max)
+        };
+        // Without it the view trails the turn at the clamp and slides the clamp's worth after the
+        // robot has stopped; with it, it is nearly there already.
+        let plain = travel_after_stop(None);
+        let damped = travel_after_stop(Some(DAMPING));
+        assert!(plain > 4f64.to_radians(), "{}", plain.to_degrees());
+        assert!(damped < 1f64.to_radians(), "{}", damped.to_degrees());
+    }
+
+    #[test]
+    fn turn_damping_does_not_overshoot_the_end_of_a_turn() {
+        for (real, virtual_heading) in turn(Some(DAMPING), 0.5) {
+            assert!(virtual_heading <= real + 1e-9, "{virtual_heading} > {real}");
+        }
+    }
+
+    #[test]
+    fn turn_damping_leaves_the_gait_sway_smoothed() {
+        // robot01's heading sways at 1.9 Hz; at 1.5 deg amplitude its rate peaks at 0.31 rad/s,
+        // which the two rate stages bring well under the deadband.
+        let sway_residual = |damping| {
+            let mut s = Stabilizer::new(EisConfig {
+                zoom: 2.0,
+                smoothing_tau_s: 0.35,
+                smoothing_order: SmoothingOrder::Second,
+                turn_damping: damping,
+                cam_from_imu: Mat3::from_rpy_deg(-90.0, 0.0, -90.0).transpose(),
+                ..config()
+            });
+            let amplitude = 1.5f64.to_radians();
+            let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+            for i in 0..180 {
+                let t = f64::from(i) / 30.0;
+                let angle = amplitude * (2.0 * std::f64::consts::PI * 1.9 * t).sin();
+                s.correction(
+                    (t * 1e9) as i64,
+                    Quat::from_axis_angle([0.0, 0.0, 1.0], angle),
+                );
+                if i >= 120 {
+                    low = low.min(heading(s.virtual_camera()));
+                    high = high.max(heading(s.virtual_camera()));
+                }
+            }
+            (high - low) / 2.0 / amplitude
+        };
+        let (plain, damped) = (sway_residual(None), sway_residual(Some(DAMPING)));
+        assert!((damped - plain).abs() < 0.05 * plain, "{plain} vs {damped}");
+    }
+
+    #[test]
+    fn heading_is_the_rotation_about_world_z_and_ignores_tilt() {
+        let yaw = Quat::from_axis_angle([0.0, 0.0, 1.0], 0.7);
+        assert!((heading(yaw) - 0.7).abs() < 1e-12);
+        // A body pitched first (the lidar's mount) and then turned still heads the turn's way.
+        let pitched = yaw * Quat::from_axis_angle([0.0, 1.0, 0.0], 0.25);
+        assert!((heading(pitched) - 0.7).abs() < 1e-12);
+        // Half a turn either way is the same angle; only the magnitude is pinned.
+        assert!(
+            (wrap_angle(3.0 * std::f64::consts::PI).abs() - std::f64::consts::PI).abs() < 1e-12
+        );
+        assert!((wrap_angle(2.0 * std::f64::consts::PI + 0.25) - 0.25).abs() < 1e-12);
+        assert!((wrap_angle(-0.5) + 0.5).abs() < 1e-12);
     }
 
     #[test]
