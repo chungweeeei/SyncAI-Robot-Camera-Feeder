@@ -4,8 +4,11 @@
 //! is unit-tested without a camera, a GStreamer install or a ROS graph — the same reason the
 //! WebRTC worker builds its pipeline as a string in `BuildVideoPipelineString`.
 
-/// The appsink feeding `image_raw/compressed`; the node looks it up by this name.
+/// The appsink feeding `image_raw/compressed`, the camera's own frames in either mode; the node
+/// looks it up by this name.
 pub const ROS_SINK_NAME: &str = "ros";
+/// The appsink at the end of the stabilized output pipeline, feeding `image_stabilized/compressed`.
+pub const STABILIZED_SINK_NAME: &str = "stabilized";
 /// The appsink at the end of the stabilized capture pipeline, where the decoded I420 frames come
 /// out to be warped.
 pub const RAW_SINK_NAME: &str = "raw";
@@ -258,7 +261,10 @@ pub fn build_pipeline_string(config: &PipelineConfig) -> String {
     let source = source(config);
     let rtp_branch = rtp_branch(config);
     let rate_limit = rate_limit(config);
-    let ros_branch = format!("t. ! {LEAKY_QUEUE}{rate_limit} ! {}", ros_appsink());
+    let ros_branch = format!(
+        "t. ! {LEAKY_QUEUE}{rate_limit} ! {}",
+        appsink(ROS_SINK_NAME)
+    );
 
     format!("{source} ! tee name=t {rtp_branch} {ros_branch}")
 }
@@ -266,16 +272,29 @@ pub fn build_pipeline_string(config: &PipelineConfig) -> String {
 /// The two descriptions of the stabilized path (`stabilize: true`).
 ///
 /// ```text
-/// capture: v4l2src ! image/jpeg ! identity [! rate_limit] ! queue ! <decoder> ! I420 ! appsink name=raw
-///                                                                    │ Rust: warp by the IMU orientation
+/// capture: v4l2src ! image/jpeg ! identity [! rate_limit] ! tee ─┬─ queue ! <decoder> ! I420 ! appsink name=raw
+///                                                                │                     │ Rust: warp by the IMU orientation
+///                                                                └─ queue ! appsink name=ros   (the camera's own JPEG)
 /// output:  appsrc name=warped ! <encoder> ! tee ─┬─ queue ! rtpjpegpay ! udpsink
-///                                                └─ queue ! appsink name=ros
+///                                                └─ queue ! appsink name=stabilized
 /// ```
 ///
-/// The rate limit sits *before* the decoder, so only `ros_framerate` frames per second are
-/// decoded, warped and re-encoded — and the RTP branch, downstream of the warp, carries that rate
-/// too rather than `framerate`. The queue in front of the decoder moves decoding off the capture
-/// thread and drops rather than blocks when the warp falls behind, as the tee queues do.
+/// The warped image is for people to look at: it feeds the RTP branch (the operator's WebRTC
+/// view) and `image_stabilized/compressed` (recording that view, e.g. for `tools/eis_fit.py
+/// residual --stabilized`). `image_raw/compressed` is teed off *before* the decoder and carries
+/// the camera's JPEG untouched, exactly as the passthrough does: a warped frame is a virtual camera
+/// rotated by up to the zoom's margin (~6°) away from the physical one, magnified by `zoom` and
+/// resampled through a pinhole model over a distorted lens, so neither `camera_info` nor the TF of
+/// the camera's frame describe it, and a consumer projecting lidar points into it (the semantic
+/// mapping) misplaces them by tens of pixels. The rotation it removes is what the LIO pose at the
+/// frame's stamp already accounts for.
+///
+/// The rate limit sits *before* the tee, so only `ros_framerate` frames per second are decoded,
+/// warped and re-encoded — and the RTP branch, downstream of the warp, carries that rate too
+/// rather than `framerate`. The queue in front of the decoder moves decoding off the capture
+/// thread and drops rather than blocks when the warp falls behind, as the tee queues do; the ROS
+/// branch's leaky queue keeps a slow publish from stalling the warp, and the warp from stalling
+/// the publish.
 ///
 /// The decoder and encoder are `codec`'s; see [`decoder`] and [`encoder`]. Either way the warp
 /// sees system-memory I420 and the encoder is handed system-memory I420, so nothing between the
@@ -290,11 +309,14 @@ pub fn build_stabilized_pipelines(
     codec: JpegCodec,
 ) -> StabilizedPipelines {
     let capture = format!(
-        "{}{} ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
-         ! {} ! appsink name={RAW_SINK_NAME} sync=false max-buffers=1 drop=true",
+        "{}{} ! tee name=t \
+         t. ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! {} ! appsink name={RAW_SINK_NAME} sync=false max-buffers=1 drop=true \
+         t. ! {LEAKY_QUEUE} ! {}",
         source(config),
         rate_limit(config),
         decoder(codec),
+        appsink(ROS_SINK_NAME),
     );
     let output = format!(
         "appsrc name={WARPED_SRC_NAME} is-live=true format=time do-timestamp=false block=false \
@@ -306,7 +328,7 @@ pub fn build_stabilized_pipelines(
         config.ros_framerate,
         encoder(codec),
         rtp_branch(config),
-        ros_appsink(),
+        appsink(STABILIZED_SINK_NAME),
     );
     StabilizedPipelines { capture, output }
 }
@@ -405,8 +427,9 @@ fn rate_limit(config: &PipelineConfig) -> String {
     }
 }
 
-fn ros_appsink() -> String {
-    format!("appsink name={ROS_SINK_NAME} sync=false max-buffers=2 drop=true")
+/// An appsink feeding a JPEG topic: [`ROS_SINK_NAME`] or [`STABILIZED_SINK_NAME`].
+fn appsink(name: &str) -> String {
+    format!("appsink name={name} sync=false max-buffers=2 drop=true")
 }
 
 #[cfg(test)]
@@ -583,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn stabilized_capture_rate_limits_before_decoding_into_the_raw_sink() {
+    fn stabilized_capture_rate_limits_before_the_tee_and_decodes_into_the_raw_sink() {
         let StabilizedPipelines { capture, .. } =
             build_stabilized_pipelines(&stabilized_config(), JpegCodec::Software);
         assert!(
@@ -593,18 +616,42 @@ mod tests {
         let rate_limit = capture
             .find(&format!("identity name={RATE_LIMIT_NAME}"))
             .unwrap();
+        let tee = capture.find("tee name=t").unwrap();
         let queue = capture.find("queue max-size-buffers=2").unwrap();
         let decoder = capture.find("jpegdec ! video/x-raw,format=I420").unwrap();
-        assert!(rate_limit < queue && queue < decoder, "{capture}");
-        assert_eq!(capture.matches("leaky=downstream").count(), 1, "{capture}");
-        assert!(
-            capture.ends_with(&format!(
+        let raw = capture
+            .find(&format!(
                 "appsink name={RAW_SINK_NAME} sync=false max-buffers=1 drop=true"
-            )),
+            ))
+            .unwrap();
+        assert!(
+            rate_limit < tee && tee < queue && queue < decoder && decoder < raw,
             "{capture}"
         );
-        assert!(!capture.contains("tee"), "{capture}");
+        // One leaky queue in front of each branch.
+        assert_eq!(capture.matches("leaky=downstream").count(), 2, "{capture}");
+        assert_eq!(capture.matches(RATE_LIMIT_NAME).count(), 1, "{capture}");
         assert!(!capture.contains("do-timestamp"), "{capture}");
+    }
+
+    #[test]
+    fn stabilized_ros_branch_is_the_cameras_own_jpeg() {
+        // image_raw/compressed is what camera_info and the camera's TF describe, so it must never
+        // carry a warped frame: it leaves the capture pipeline before the decoder, and the output
+        // pipeline has no appsink of that name.
+        for codec in [JpegCodec::Software, JpegCodec::Nvidia] {
+            let StabilizedPipelines { capture, output } =
+                build_stabilized_pipelines(&stabilized_config(), codec);
+            let ros_sink = format!("appsink name={ROS_SINK_NAME} ");
+            let sink = capture.find(&ros_sink).unwrap();
+            let branch = &capture[capture[..sink].rfind("t. !").unwrap()..];
+            assert_eq!(
+                branch,
+                format!("t. ! {LEAKY_QUEUE} ! {}", appsink(ROS_SINK_NAME)),
+                "{codec:?}"
+            );
+            assert!(!output.contains(&ros_sink), "{output}");
+        }
     }
 
     #[test]
@@ -629,7 +676,7 @@ mod tests {
         );
         assert!(
             output.ends_with(&format!(
-                "appsink name={ROS_SINK_NAME} sync=false max-buffers=2 drop=true"
+                "appsink name={STABILIZED_SINK_NAME} sync=false max-buffers=2 drop=true"
             )),
             "{output}"
         );
@@ -667,13 +714,22 @@ mod tests {
 
     #[test]
     fn the_branches_are_the_same_in_both_modes() {
-        // The RTP branch and the ROS appsink come from the same helpers, so a change to one mode
-        // cannot silently diverge from the other.
+        // The RTP branch and the ROS branch come from the same helpers, so a change to one mode
+        // cannot silently diverge from the other. At full rate, where the passthrough's ROS
+        // branch has no rate limit inside it.
         let passthrough = build_pipeline_string(&config());
-        let branch = |s: &str| s[s.find("t. !").unwrap()..].to_string();
+        let first = |s: &str| {
+            let start = s.find("t. !").unwrap();
+            let end = start + 1 + s[start + 1..].find("t. !").unwrap();
+            s[start..end].to_string()
+        };
+        let last = |s: &str| s[s.rfind("t. !").unwrap()..].to_string();
         for codec in [JpegCodec::Software, JpegCodec::Nvidia] {
-            let StabilizedPipelines { output, .. } = build_stabilized_pipelines(&config(), codec);
-            assert_eq!(branch(&passthrough), branch(&output), "{codec:?}");
+            let StabilizedPipelines { capture, output } =
+                build_stabilized_pipelines(&config(), codec);
+            assert_eq!(first(&passthrough), first(&output), "{codec:?}");
+            assert!(first(&output).contains("rtpjpegpay"), "{output}");
+            assert_eq!(last(&passthrough), last(&capture), "{codec:?}");
         }
     }
 
@@ -695,11 +751,16 @@ mod tests {
                 "{out}"
             );
         }
-        // Before the decoder, which on the NVIDIA chain fails on them.
+        // Before the tee, so the raw ROS branch does not see them either, and so before the
+        // decoder, which on the NVIDIA chain fails on them.
         for codec in [JpegCodec::Software, JpegCodec::Nvidia] {
             let StabilizedPipelines { capture, output } =
                 build_stabilized_pipelines(&stabilized_config(), codec);
             assert_eq!(capture.matches(DROP_CORRUPTED).count(), 1, "{capture}");
+            assert!(
+                capture.find(DROP_CORRUPTED).unwrap() < capture.find("tee name=t").unwrap(),
+                "{capture}"
+            );
             assert!(
                 capture.find(DROP_CORRUPTED).unwrap() < capture.find(decoder(codec)).unwrap(),
                 "{capture}"

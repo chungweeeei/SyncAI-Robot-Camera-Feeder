@@ -93,16 +93,29 @@ container whose device is missing).
 New logic that can be expressed over plain Rust types goes in a pure module with unit tests.
 
 **Stabilization (`stabilize: true`)** is gyro-based EIS: the capture pipeline is rate-limited to
-`ros_framerate`, decodes to system-memory I420 and ends in a raw appsink; the warp maps each
-frame into a low-passed "virtual camera" using the IMU orientation at the frame's capture time; an
-output pipeline (`appsrc ! <encoder> ! tee`) carries the usual two branches, both now at
+`ros_framerate` and tees into the ROS appsink (the camera's JPEG, untouched) and a decoder to
+system-memory I420 ending in a raw appsink; the warp maps each frame into a low-passed "virtual
+camera" using the IMU orientation at the frame's capture time; an output pipeline (`appsrc !
+<encoder> ! tee`) carries the RTP branch and `image_stabilized/compressed`, both at
 `ros_framerate`. The decoder and encoder are the `jpeg_codec`'s (see "Hardware JPEG" below).
 `pipeline.rs` renders both descriptions (`build_stabilized_pipelines`) from the same branch
 helpers as the passthrough string, which stays byte-for-byte what it was when `stabilize` is off.
-The capture stamp is computed on the capture pipeline and handed to the output appsink in a
-PTS-keyed table (`StampTable`), because the two pipelines have different clocks and base times.
-Frames without an orientation (no IMU yet, IMU stale) pass through zoomed but unwarped, with a
-throttled warning; the pipeline never stalls on the IMU.
+The stabilized frames' capture stamp is computed on the capture pipeline and handed to the output
+appsink in a PTS-keyed table (`StampTable`), because the two pipelines have different clocks and
+base times; `image_raw/compressed` is stamped on the capture pipeline itself. Frames without an
+orientation (no IMU yet, IMU stale) pass through zoomed but unwarped, with a throttled warning;
+the pipeline never stalls on the IMU.
+
+**`image_raw/compressed` is never warped.** It is what `camera_info` and the camera's TF describe,
+and the semantic mapping (`syncai_mapping`'s `feat/semantic-mapping-offline`) projects lidar points
+into it with them and the LIO pose at the frame's stamp. A warped frame is a virtual camera
+rotated per frame by up to the zoom's margin (~6°, tens of pixels) away from the physical one,
+magnified by `zoom`, and resampled through a pinhole homography over a distorted lens, so no
+`camera_info` describes it, and the rotation it removes is exactly what that pose already accounts
+for. Until 2026-10-20 both branches carried the warped image (and `camera_info` was withheld with
+`stabilize` on); the warped frames now only feed the WebRTC view and
+`image_stabilized/compressed`, which is for watching and recording that view, not for projecting.
+A unit test guards it.
 
 **Nothing between `v4l2src` and a stamp may restamp a frame.** The message stamp is the buffer's
 PTS turned into node time (`stamp.rs`), so an element that rewrites PTS silently moves every stamp,
@@ -191,9 +204,13 @@ the ROS `PYTHONPATH`:
   walking straight and turning, how far the view trails a turn and slides after one, and what each
   Mahony gain injects. A zstd-compressed bag cannot be read from a read-only mount (rosbag2
   decompresses next to it); decompress a copy first.
-- `offset BAG`: fits `imu_time_offset_ms` from raw frames (stabilize off) against the gyro. The
-  frames' stamps must be the capture's own, i.e. recorded after 2026-10-16 17:50 (`ece6437`).
-- `residual BAG [--stabilized]`: the gait-band shake measured in a recording's frames, for an A/B.
+- `offset BAG`: fits `imu_time_offset_ms` from raw frames (`image_raw/compressed`) against the
+  gyro. The frames' stamps must be the capture's own, i.e. recorded after 2026-10-16 17:50
+  (`ece6437`), and before 2026-10-20 only with stabilize off (until then the topic carried the
+  warped frames with stabilize on).
+- `residual BAG [--stabilized]`: the gait-band shake measured in a recording's frames, for an A/B:
+  `image_raw/compressed` by default, `image_stabilized/compressed` with `--stabilized`. A bag
+  recorded with stabilize on after 2026-10-20 has both, so one recording is the whole A/B.
 
 Its orientation filter and low-pass mirror `imu.rs` and `eis.rs` line for line, and it reads the
 params file the way `parameters.rs` does: change them together.

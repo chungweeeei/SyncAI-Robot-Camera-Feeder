@@ -42,13 +42,15 @@ const IMU_HISTORY: usize = 400;
 ///
 /// With a `camera_info_file`, the calibration is published once on `camera_info`, latched
 /// (reliable + transient local), rather than beside every image: it never changes while the node
-/// runs. Only on the passthrough path: see `camera_info_publisher`.
+/// runs. It describes `image_raw/compressed` in both modes.
 ///
-/// With `stabilize` on, the capture pipeline instead ends in a raw appsink, each decoded frame is
+/// With `stabilize` on, the capture pipeline also tees into a raw appsink, each decoded frame is
 /// warped by the IMU orientation at its capture time (`warp_bridge.rs`), and a second, output
-/// pipeline encodes the warped frames and carries the same two branches. Decoding and encoding
-/// run on the Jetson's hardware JPEG blocks when the L4T plugins are there (`jpeg_codec`), on the
-/// CPU otherwise; the warp is on the CPU either way.
+/// pipeline encodes the warped frames for the RTP branch and for `image_stabilized/compressed`.
+/// `image_raw/compressed` stays the camera's own JPEG, teed off before the decoder: see
+/// `pipeline::build_stabilized_pipelines` for why the warped image is no use to a consumer that
+/// projects into it. Decoding and encoding run on the Jetson's hardware JPEG blocks when the L4T
+/// plugins are there (`jpeg_codec`), on the CPU otherwise; the warp is on the CPU either way.
 ///
 /// # Threading
 ///
@@ -122,9 +124,25 @@ impl CameraFeederNode {
                     .and_then(|element| element.downcast::<gst_app::AppSrc>().ok())
                     .ok_or("the output pipeline has no appsrc for the warped frames")?;
 
-                let stamps: SharedStamps = Arc::default();
-                appsink(&output, pipeline::ROS_SINK_NAME)?.set_callbacks(frame_publisher(
+                // The camera's own frames, as on the passthrough path.
+                appsink(&capture, pipeline::ROS_SINK_NAME)?.set_callbacks(frame_publisher(
                     publisher,
+                    node.get_clock(),
+                    node.logger().clone(),
+                    config.frame_id.clone(),
+                    StampSource::PipelineClock,
+                ));
+                // The warped ones, under the same frame_id although no fixed K or TF describes
+                // them: they are for watching and recording the operator's view, not projecting.
+                let stabilized_publisher: Publisher<CompressedImage> = node.create_publisher(
+                    "image_stabilized/compressed"
+                        .keep_last(5)
+                        .best_effort()
+                        .volatile(),
+                )?;
+                let stamps: SharedStamps = Arc::default();
+                appsink(&output, pipeline::STABILIZED_SINK_NAME)?.set_callbacks(frame_publisher(
+                    stabilized_publisher,
                     node.get_clock(),
                     node.logger().clone(),
                     config.frame_id,
@@ -188,7 +206,8 @@ impl CameraFeederNode {
             Some(stabilize) => log_info!(
                 node.logger(),
                 "[CameraFeederNode] streaming {}x{}@{}, stabilized by {} (zoom {}, {} x tau {} s, \
-                 {}, mahony kp {}) at {} fps to {}:{} (RTP/JPEG) and image_raw/compressed",
+                 {}, mahony kp {}) at {} fps to {}:{} (RTP/JPEG) and image_stabilized/compressed; \
+                 image_raw/compressed unstabilized",
                 config.pipeline.width,
                 config.pipeline.height,
                 config.pipeline.framerate,
@@ -401,9 +420,10 @@ fn imu_subscription(
 /// None of the failures stops the node: the camera still serves the WebRTC view and the image
 /// topic without a calibration, and an exit would only respawn into the same file.
 ///
-/// With `stabilize` on there is none by design: every frame is warped by a rotation that changes
-/// per frame and magnified by `zoom`, so no fixed K and D describe the published image, and a
-/// consumer projecting points with the lens's would misplace them.
+/// `stabilize` does not change it: `image_raw/compressed` is the camera's own JPEG in both modes.
+/// Until 2026-10-20 the stabilized path published the warped frames there and so no
+/// `camera_info` at all; `image_stabilized/compressed`, where they go now, has none, since a
+/// rotation that changes per frame and the `zoom` leave no fixed K and D to describe it.
 fn camera_info_publisher(
     node: &Node,
     config: &parameters::Config,
@@ -413,14 +433,6 @@ fn camera_info_publisher(
         log_info!(
             node.logger(),
             "[CameraFeederNode] no camera_info_file; camera_info is not published"
-        );
-        return Ok(None);
-    }
-    if config.stabilize.is_some() {
-        log_warn!(
-            node.logger(),
-            "[CameraFeederNode] stabilize is on, so the published frames are warped and {path} \
-             does not describe them; camera_info is not published"
         );
         return Ok(None);
     }
@@ -477,12 +489,13 @@ fn camera_info_publisher(
     Ok(Some(publisher))
 }
 
-/// Where the ROS appsink's callback takes a frame's capture stamp from.
+/// Where an appsink's callback takes a frame's capture stamp from.
 enum StampSource {
-    /// Computed here from the pipeline clock: the appsink is on the capture pipeline.
+    /// Computed here from the pipeline clock: the appsink is on the capture pipeline
+    /// (`image_raw/compressed`, in both modes).
     PipelineClock,
-    /// Looked up by PTS: the appsink is on the output pipeline, and the warp recorded the stamp
-    /// it computed on the capture pipeline.
+    /// Looked up by PTS: the appsink is on the output pipeline (`image_stabilized/compressed`),
+    /// and the warp recorded the stamp it computed on the capture pipeline.
     Table(SharedStamps),
 }
 
@@ -497,6 +510,9 @@ enum StampSource {
 /// to when it goes PLAYING. The closure must not capture the pipeline: the pipeline owns the
 /// appsink and the appsink owns this closure, so a captured pipeline would be a reference cycle
 /// that is never freed.
+///
+/// The first-frame log is a flag of this closure's, not `logger.once()`: rclrs keeps `once` per
+/// call site, and with `stabilize` on two of these closures share the call site, one per topic.
 fn frame_publisher(
     publisher: Publisher<CompressedImage>,
     clock: Clock,
@@ -504,6 +520,8 @@ fn frame_publisher(
     frame_id: String,
     stamp_source: StampSource,
 ) -> gst_app::AppSinkCallbacks {
+    let topic = publisher.topic_name();
+    let mut published_any = false;
     gst_app::AppSinkCallbacks::builder()
         .new_sample(move |sink| {
             let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
@@ -553,14 +571,18 @@ fn frame_publisher(
             };
 
             match publisher.publish(message) {
-                Ok(()) => log_info!(
-                    logger.once(),
-                    "[CameraFeederNode] first frame published ({} bytes)",
-                    map.len(),
-                ),
+                Ok(()) if !published_any => {
+                    published_any = true;
+                    log_info!(
+                        &logger,
+                        "[CameraFeederNode] first frame published on {topic} ({} bytes)",
+                        map.len(),
+                    );
+                }
+                Ok(()) => {}
                 Err(err) => log_warn!(
                     logger.throttle(Duration::from_secs(5)),
-                    "[CameraFeederNode] publish failed, frame dropped: {err}",
+                    "[CameraFeederNode] publish on {topic} failed, frame dropped: {err}",
                 ),
             }
             Ok(gst::FlowSuccess::Ok)
