@@ -13,14 +13,17 @@ filters   IMU only. Re-runs the orientation filter and the virtual-camera low-pa
           smoothing setting leaves in the picture, and how much each Mahony gain injects. Any bag
           with the lidar IMU will do, including ones whose image stamps are wrong.
 offset    Fits imu_time_offset_ms: the frame-to-frame image shift measured by phase correlation
-          against the shift the gyro predicts, swept over the offset. Needs raw frames
-          (stabilize off) stamped with the capture's own time, i.e. a bag recorded after
-          2026-10-16 17:50 (ece6437): earlier frames went through videorate, which stamped them
-          0-16.7 ms early by an amount fixed per recording, and a fit on them measures that.
+          against the shift the gyro predicts, swept over the offset. Needs raw frames stamped
+          with the capture's own time, i.e. a bag recorded after 2026-10-16 17:50 (ece6437):
+          earlier frames went through videorate, which stamped them 0-16.7 ms early by an amount
+          fixed per recording, and a fit on them measures that. image_raw/compressed is raw in
+          either mode since 2026-10-20; before that, only with stabilize off.
 residual  The gait-band image shake of a recording, from its frames alone (and, when the bag has
           the IMU, what the unstabilized camera did over the same time): the before/after number
-          of an on-robot A/B. Pass --stabilized for a recording made with stabilize on, so the
-          zoomed focal length converts pixels to degrees.
+          of an on-robot A/B. Pass --stabilized to measure image_stabilized/compressed, the
+          warped frames, so the zoomed focal length converts pixels to degrees. A bag recorded
+          with stabilize on since 2026-10-20 carries both topics: run it once with and once
+          without --stabilized.
 
 The orientation filter and the low-pass below mirror src/camera_feeder_node/imu.rs (Mahony,
 ImuBuffer) and eis.rs (Stabilizer) line for line; keep them in step when either changes. Every
@@ -862,7 +865,10 @@ def run_offset(args: argparse.Namespace, config: Config) -> None:
 
 def run_residual(args: argparse.Namespace, config: Config) -> None:
     topics = bag_topics(args.bag)
-    image_topic = pick_topic(topics, args.image_topic, IMAGE_TYPE, "image_raw/compressed")
+    # The warped frames have had a topic of their own since 2026-10-20; before that they were on
+    # image_raw/compressed, so a stabilized bag from then needs --image-topic.
+    suffix = "image_stabilized/compressed" if args.stabilized else "image_raw/compressed"
+    image_topic = pick_topic(topics, args.image_topic, IMAGE_TYPE, suffix)
     if image_topic is None:
         sys.exit(f"pass --image-topic; candidates: {topics}")
     fx = config.fx * (config.zoom if args.stabilized else 1.0)
@@ -924,7 +930,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--image-topic",
-        help="default: the one CompressedImage topic ending in image_raw/compressed",
+        help="default: the one CompressedImage topic ending in image_raw/compressed (in "
+        "image_stabilized/compressed for residual --stabilized)",
     )
     parser.add_argument(
         "--window",
@@ -972,7 +979,9 @@ def main() -> None:
     )
     residual.add_argument("bag", type=Path)
     residual.add_argument(
-        "--stabilized", action="store_true", help="the frames are the zoomed, warped output"
+        "--stabilized",
+        action="store_true",
+        help="measure image_stabilized/compressed, the zoomed, warped output",
     )
     residual.add_argument("--min-response", type=float, default=0.05)
 

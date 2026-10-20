@@ -35,10 +35,11 @@ const STATS_THROTTLE: Duration = Duration::from_secs(30);
 
 /// The capture stamps of the frames in flight between the two pipelines, keyed by PTS.
 ///
-/// The capture stamp is computed here, on the capture pipeline's clock, but published from the
-/// output pipeline's appsink, which runs on a different clock with a different base time. The
-/// PTS is the one thing that crosses unchanged (`jpegenc`, `tee` and `queue` all keep it), so the
-/// stamp travels beside the buffer in this table rather than on it.
+/// The capture stamp is computed here, on the capture pipeline's clock, but published (on
+/// `image_stabilized/compressed`) from the output pipeline's appsink, which runs on a different
+/// clock with a different base time. The PTS is the one thing that crosses unchanged (`jpegenc`,
+/// `tee` and `queue` all keep it), so the stamp travels beside the buffer in this table rather
+/// than on it. `image_raw/compressed` does not need it: its appsink is on the capture pipeline.
 #[derive(Debug, Default)]
 pub struct StampTable {
     entries: VecDeque<(u64, i64)>,

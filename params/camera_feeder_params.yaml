@@ -38,9 +38,10 @@
     # camera_calibration writes (ost.yaml), as it comes out. Empty publishes no
     # camera_info. The launch file sets it to the robot's own copy,
     # ~/robot_ws/config/calibration/<robot_id>/camera0.yaml, because intrinsics belong to one
-    # physical camera, not to this package. A missing or malformed file, one calibrated at
-    # another resolution than width x height, or stabilize: true (the warped frames have no fixed
-    # K) publishes none, with a warning; the images go on either way.
+    # physical camera, not to this package. A missing or malformed file, or one calibrated at
+    # another resolution than width x height, publishes none, with a warning; the images go on
+    # either way. It describes image_raw/compressed, which is the camera's own JPEG whether
+    # stabilize is on or off; image_stabilized/compressed has no calibration.
     camera_info_file: ""
 
     # Sensor (ISP) controls, written through v4l2src extra-controls at capture start. The values
@@ -62,11 +63,15 @@
 
     # --- Stabilization (gyro-based EIS) ---
     # With stabilize on, the capture is rate-limited to ros_framerate, decoded, warped by the IMU
-    # orientation at each frame's capture time and re-encoded before the tee (the warp on the CPU,
-    # the JPEG codec as jpeg_codec below says): BOTH the RTP and the ROS branch carry the
-    # stabilized image, and the RTP branch then runs at ros_framerate rather than framerate. Off
-    # (the default), the pipeline is the untouched MJPEG passthrough above. Leave it off until
-    # fx/fy/cx/cy and imu_to_camera_rpy_deg are calibrated.
+    # orientation at each frame's capture time and re-encoded (the warp on the CPU, the JPEG codec
+    # as jpeg_codec below says) for the RTP branch, which then runs at ros_framerate rather than
+    # framerate, and for image_stabilized/compressed. image_raw/compressed stays the camera's own
+    # JPEG (at ros_framerate, with camera_info), teed off before the decoder: a warped frame is
+    # rotated per frame away from the physical camera and magnified by zoom, so a consumer
+    # projecting lidar points into it with camera_info and TF (the semantic mapping) would
+    # misplace them. Until 2026-10-20 both branches carried the warped image. Off (the default),
+    # the pipeline is the untouched MJPEG passthrough above. Leave it off until fx/fy/cx/cy and
+    # imu_to_camera_rpy_deg are calibrated.
     stabilize: false
     # sensor_msgs/Imu, relative so it is <robot_id>/livox/imu: the lidar's IMU (200 Hz, hardware
     # stamped). Only rotation is used, so any IMU rigidly mounted with the camera will do.
