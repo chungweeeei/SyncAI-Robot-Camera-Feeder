@@ -7,7 +7,7 @@ use super::imu::MahonyGains;
 use super::math::Mat3;
 use super::pipeline::{
     DEFAULT_EXPOSURE_TIME_100US, DEFAULT_WHITE_BALANCE_KELVIN, Exposure, JpegCodecChoice,
-    PipelineConfig, PowerLineFrequency, SensorControls, WhiteBalance,
+    PipelineConfig, PowerLineFrequency, RtpClient, SensorControls, WhiteBalance,
 };
 
 const DEFAULT_DEVICE: &str = "/dev/syncai/camera0";
@@ -156,6 +156,12 @@ impl Parameters {
             DEFAULT_RTP_PORT.into(),
             "RTP/JPEG destination port; the WebRTC worker's VIDEO_RTP_IN_PORT",
         )?;
+        let rtp_extra_clients = text(
+            "rtp_extra_clients",
+            "",
+            "further receivers of the same RTP/JPEG stream, as host:port[,host:port...]; empty = \
+             none",
+        )?;
         let ros_framerate = integer(
             "ros_framerate",
             DEFAULT_ROS_FRAMERATE.into(),
@@ -294,6 +300,7 @@ impl Parameters {
         let height_value = positive("height", height.get(), DEFAULT_HEIGHT, &mut warn);
         let ros_framerate_value = ros_rate(ros_framerate.get(), framerate_value);
         let exposure_value = exposure(auto_exposure.get(), exposure_time.get(), &mut warn);
+        let rtp_port_value = port(rtp_port.get(), &mut warn);
 
         let stabilize_config = stabilize.get().then(|| {
             if ros_framerate_value >= framerate_value {
@@ -379,8 +386,16 @@ impl Parameters {
                 width: width_value,
                 height: height_value,
                 framerate: framerate_value,
+                rtp_extra_clients: extra_clients(
+                    &rtp_extra_clients.get(),
+                    &RtpClient {
+                        host: rtp_host.get().to_string(),
+                        port: rtp_port_value,
+                    },
+                    &mut warn,
+                ),
                 rtp_host: rtp_host.get().to_string(),
-                rtp_port: port(rtp_port.get(), &mut warn),
+                rtp_port: rtp_port_value,
                 ros_framerate: ros_framerate_value,
                 source_override: source_override.get().to_string(),
                 sensor_controls: SensorControls {
@@ -408,6 +423,7 @@ impl Parameters {
                 _text: vec![
                     device,
                     rtp_host,
+                    rtp_extra_clients,
                     frame_id,
                     source_override,
                     camera_info_file,
@@ -694,6 +710,54 @@ fn port(value: i64, warn: &mut impl FnMut(String)) -> u16 {
     }
 }
 
+/// `rtp_extra_clients`: `host:port` entries separated by commas, the format of `multiudpsink`'s
+/// own `clients`.
+///
+/// A string rather than a string array because an empty array cannot be written in a params file
+/// (rcl's YAML parser cannot type an empty sequence and refuses the file) and is awkward to pass
+/// from a launch file; the empty string is the natural "none". Each entry is checked on its own,
+/// and a bad one is dropped with a warning, the rest kept: one mistyped receiver should not cost
+/// the others their stream, nor the WebRTC worker its. Dropped too, with a warning, is the
+/// worker's own destination and any repeat, which would send the receiver every packet twice.
+/// IPv6 literals are not accepted: `multiudpsink` (1.20) splits each entry at its first `:`.
+fn extra_clients(
+    value: &str,
+    primary: &RtpClient,
+    warn: &mut impl FnMut(String),
+) -> Vec<RtpClient> {
+    let mut clients: Vec<RtpClient> = Vec::new();
+    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some(client) = rtp_client(entry) else {
+            warn(format!(
+                "rtp_extra_clients entry \"{entry}\" is not host:port (an IPv4 address or a name, \
+                 and a port in 1..=65535); skipping it"
+            ));
+            continue;
+        };
+        if client == *primary || clients.contains(&client) {
+            warn(format!(
+                "rtp_extra_clients entry {client} is already a destination; skipping the repeat"
+            ));
+            continue;
+        }
+        clients.push(client);
+    }
+    clients
+}
+
+fn rtp_client(entry: &str) -> Option<RtpClient> {
+    let (host, port) = entry.split_once(':')?;
+    let valid_host = !host.is_empty()
+        && !host
+            .chars()
+            .any(|c| c == ':' || c == ',' || c == '"' || c.is_whitespace());
+    let port = port.parse::<u16>().ok().filter(|p| *p > 0)?;
+    valid_host.then(|| RtpClient {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// `ros_framerate`: 0 — and anything that is not a lower positive rate — means the ROS branch
 /// carries every captured frame.
 fn ros_rate(value: i64, framerate: u32) -> u32 {
@@ -731,6 +795,55 @@ mod tests {
         assert_eq!(port(0, &mut ignore), DEFAULT_RTP_PORT);
         assert_eq!(port(65_536, &mut ignore), DEFAULT_RTP_PORT);
         assert_eq!(port(-1, &mut ignore), DEFAULT_RTP_PORT);
+    }
+
+    fn client(host: &str, port: u16) -> RtpClient {
+        RtpClient {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn extra_clients_parse_as_a_comma_separated_list() {
+        let worker = client("127.0.0.1", DEFAULT_RTP_PORT);
+        assert_eq!(extra_clients("", &worker, &mut ignore), Vec::new());
+        assert_eq!(extra_clients(" , ", &worker, &mut ignore), Vec::new());
+        assert_eq!(
+            extra_clients(
+                " 127.0.0.1:5010 , robot01.local:5004,",
+                &worker,
+                &mut ignore
+            ),
+            vec![client("127.0.0.1", 5010), client("robot01.local", 5004)]
+        );
+    }
+
+    #[test]
+    fn bad_extra_clients_are_dropped_and_the_rest_kept() {
+        let worker = client("127.0.0.1", DEFAULT_RTP_PORT);
+        let mut warnings = Vec::new();
+        let got = extra_clients(
+            "127.0.0.1,:5010,host:0,host:65536,host:x,::1:5010,a b:5010,a\"b:5010,127.0.0.1:5010",
+            &worker,
+            &mut |m| warnings.push(m),
+        );
+        assert_eq!(got, vec![client("127.0.0.1", 5010)]);
+        assert_eq!(warnings.len(), 8, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("rtp_extra_clients")));
+    }
+
+    #[test]
+    fn the_worker_and_repeats_are_not_sent_to_twice() {
+        let worker = client("127.0.0.1", DEFAULT_RTP_PORT);
+        let mut warnings = Vec::new();
+        let got = extra_clients(
+            "127.0.0.1:5008,127.0.0.1:5010,127.0.0.1:5010",
+            &worker,
+            &mut |m| warnings.push(m),
+        );
+        assert_eq!(got, vec![client("127.0.0.1", 5010)]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 
     #[test]

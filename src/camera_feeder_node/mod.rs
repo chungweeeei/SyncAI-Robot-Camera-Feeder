@@ -192,21 +192,34 @@ impl CameraFeederNode {
             return Err(err);
         }
 
+        // The worker's destination first, then any rtp_extra_clients.
+        let rtp_destinations = std::iter::once(format!(
+            "{}:{}",
+            config.pipeline.rtp_host, config.pipeline.rtp_port
+        ))
+        .chain(
+            config
+                .pipeline
+                .rtp_extra_clients
+                .iter()
+                .map(ToString::to_string),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
         match &config.stabilize {
             None => log_info!(
                 node.logger(),
-                "[CameraFeederNode] streaming {}x{}@{} to {}:{} (RTP/JPEG) and image_raw/compressed @{}",
+                "[CameraFeederNode] streaming {}x{}@{} to {} (RTP/JPEG) and image_raw/compressed @{}",
                 config.pipeline.width,
                 config.pipeline.height,
                 config.pipeline.framerate,
-                config.pipeline.rtp_host,
-                config.pipeline.rtp_port,
+                rtp_destinations,
                 config.pipeline.ros_framerate,
             ),
             Some(stabilize) => log_info!(
                 node.logger(),
                 "[CameraFeederNode] streaming {}x{}@{}, stabilized by {} (zoom {}, {} x tau {} s, \
-                 {}, mahony kp {}) at {} fps to {}:{} (RTP/JPEG) and image_stabilized/compressed; \
+                 {}, mahony kp {}) at {} fps to {} (RTP/JPEG) and image_stabilized/compressed; \
                  image_raw/compressed unstabilized",
                 config.pipeline.width,
                 config.pipeline.height,
@@ -224,8 +237,7 @@ impl CameraFeederNode {
                 ),
                 stabilize.mahony.kp,
                 config.pipeline.ros_framerate,
-                config.pipeline.rtp_host,
-                config.pipeline.rtp_port,
+                rtp_destinations,
             ),
         }
 

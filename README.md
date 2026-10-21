@@ -41,6 +41,7 @@ a pipeline error). Not yet run against the real camera on the robot.
 | Publish | `image_stabilized/compressed` | `sensor_msgs/CompressedImage`, `format: jpeg` | Only with `stabilize` on: the warped, zoomed frames the WebRTC worker gets, at `ros_framerate`, same QoS. No `camera_info` describes them |
 | Publish | `camera_info` | `sensor_msgs/CameraInfo` | Once at start, latched (reliable, transient local, depth 1); only with a valid `camera_info_file`. Describes `image_raw/compressed` |
 | Send | `udp://127.0.0.1:5008` | RTP/JPEG (RFC 2435), payload type 26 | 60 Hz (`framerate`), for the WebRTC worker's `rtpjpeg` source; stabilized at `ros_framerate` with `stabilize` on |
+| Send | each of `rtp_extra_clients` | the same RTP/JPEG packets | Empty by default. For another GStreamer receiver beside the worker: the branch becomes `multiudpsink`, payloaded once; see below |
 
 - **Nothing is decoded** (by default). The camera's JPEG bytes go to both branches untouched, each
   behind its own leaky queue so neither consumer can stall the capture or the other.
@@ -88,6 +89,17 @@ a pipeline error). Not yet run against the real camera on the robot.
 - **ISP controls** (exposure, white balance, gain, flicker) are written once at capture start with
   the WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
 - **On any pipeline error the node exits** and the launch file respawns it.
+- **Another GStreamer receiver** gets the RTP stream through `rtp_extra_clients`
+  (`"127.0.0.1:5010"`, comma-separated for more), never by opening the camera or by binding the
+  worker's 5008 (unicast: a second socket there takes packets from the worker instead of copying
+  them). Raw RTP carries no SDP, so the receiver states the caps:
+  ```bash
+  gst-launch-1.0 udpsrc port=5010 \
+      caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000" \
+    ! rtpjitterbuffer latency=50 ! rtpjpegdepay ! jpegdec ! videoconvert ! autovideosink
+  ```
+  In another container it needs host networking to be reachable at `127.0.0.1`. There is no RTSP
+  server here; one (MediaMTX, `gst-rtsp-server`) would be such a receiver.
 
 Parameters (all read-only) are documented in
 [`params/camera_feeder_params.yaml`](params/camera_feeder_params.yaml).
