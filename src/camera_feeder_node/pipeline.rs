@@ -179,6 +179,8 @@ pub struct PipelineConfig {
     pub framerate: u32,
     pub rtp_host: String,
     pub rtp_port: u16,
+    /// Further receivers of the same RTP stream, beside `rtp_host:rtp_port`; see [`rtp_branch`].
+    pub rtp_extra_clients: Vec<RtpClient>,
     /// Rate of the ROS branch. At or above `framerate` the branch carries every frame and has no
     /// rate limit at all.
     pub ros_framerate: u32,
@@ -188,6 +190,20 @@ pub struct PipelineConfig {
     /// `videotestsrc is-live=true ! video/x-raw,format=YUY2,width=1280,height=720,framerate=60/1 ! jpegenc`.
     pub source_override: String,
     pub sensor_controls: SensorControls,
+}
+
+/// One RTP destination, already validated (see `parameters.rs`): a host with no `:`, `,`, `"` or
+/// whitespace in it, so it can go inside `multiudpsink`'s quoted `clients` list as it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtpClient {
+    pub host: String,
+    pub port: u16,
+}
+
+impl std::fmt::Display for RtpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
 }
 
 /// Renders `v4l2src`'s `extra-controls` string.
@@ -396,12 +412,34 @@ fn source(config: &PipelineConfig) -> String {
     format!("{} ! {DROP_CORRUPTED}", capture_head(config))
 }
 
+/// The RTP/JPEG branch: `udpsink` to the WebRTC worker, or `multiudpsink` to it and to
+/// `rtp_extra_clients` when there are any.
+///
+/// Another receiver cannot share the worker's port: `udpsink` sends unicast, and a second socket
+/// bound to 5008 (with `reuse`) would take some of the datagrams from the worker rather than get a
+/// copy of each. `multiudpsink` payloads once and sends every packet to each client, so a further
+/// receiver costs a `sendto` per packet and nothing upstream. Without extra clients the branch is
+/// the `udpsink` it always was, byte for byte, so the worker's path does not change by default.
+/// A client with nothing listening is harmless: the socket is not connected, so no ICMP error
+/// comes back to it.
 fn rtp_branch(config: &PipelineConfig) -> String {
-    format!(
-        "t. ! {LEAKY_QUEUE} ! rtpjpegpay pt=26 \
-         ! udpsink host=\"{}\" port={} sync=false async=false",
-        config.rtp_host, config.rtp_port,
-    )
+    let sink = if config.rtp_extra_clients.is_empty() {
+        format!(
+            "udpsink host=\"{}\" port={}",
+            config.rtp_host, config.rtp_port
+        )
+    } else {
+        let primary = RtpClient {
+            host: config.rtp_host.clone(),
+            port: config.rtp_port,
+        };
+        let clients: Vec<String> = std::iter::once(&primary)
+            .chain(&config.rtp_extra_clients)
+            .map(ToString::to_string)
+            .collect();
+        format!("multiudpsink clients=\"{}\"", clients.join(","))
+    };
+    format!("t. ! {LEAKY_QUEUE} ! rtpjpegpay pt=26 ! {sink} sync=false async=false")
 }
 
 /// Whether frames are dropped down to `ros_framerate`: on the ROS branch, or on the whole
@@ -444,6 +482,7 @@ mod tests {
             framerate: 60,
             rtp_host: "127.0.0.1".to_string(),
             rtp_port: 5008,
+            rtp_extra_clients: Vec::new(),
             ros_framerate: 60,
             source_override: String::new(),
             sensor_controls: SensorControls::default(),
@@ -531,6 +570,40 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.matches("leaky=downstream").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn extra_clients_get_the_same_rtp_stream_through_multiudpsink() {
+        let config = PipelineConfig {
+            rtp_extra_clients: vec![
+                RtpClient {
+                    host: "127.0.0.1".to_string(),
+                    port: 5010,
+                },
+                RtpClient {
+                    host: "192.168.1.20".to_string(),
+                    port: 5004,
+                },
+            ],
+            ..config()
+        };
+        let out = build_pipeline_string(&config);
+        // The worker first, then the extras, all behind one payloader.
+        assert!(
+            out.contains(
+                "rtpjpegpay pt=26 ! multiudpsink \
+                 clients=\"127.0.0.1:5008,127.0.0.1:5010,192.168.1.20:5004\" \
+                 sync=false async=false"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("udpsink host="), "{out}");
+        assert_eq!(out.matches("rtpjpegpay").count(), 1, "{out}");
+        // The stabilized output carries the same branch.
+        for codec in [JpegCodec::Software, JpegCodec::Nvidia] {
+            let StabilizedPipelines { output, .. } = build_stabilized_pipelines(&config, codec);
+            assert!(output.contains("multiudpsink clients="), "{output}");
+        }
     }
 
     #[test]

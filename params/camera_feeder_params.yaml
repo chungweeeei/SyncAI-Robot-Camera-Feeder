@@ -19,6 +19,16 @@
     # RTP/JPEG to the WebRTC worker; must match the worker's VIDEO_RTP_IN_PORT.
     rtp_host: "127.0.0.1"
     rtp_port: 5008
+    # Further receivers of the same RTP/JPEG stream, as "host:port,host:port" (IPv4 or a name, no
+    # IPv6). Another process cannot share rtp_port: udpsink sends unicast, and a second socket on
+    # 5008 would take packets away from the worker instead of getting copies. With entries here the
+    # branch becomes `multiudpsink`, which payloads once and sends every packet to the worker and
+    # to each of them; empty keeps the plain udpsink. A receiver in another container needs host
+    # networking for 127.0.0.1 to reach it. It needs the caps spelled out, since raw RTP has no SDP:
+    #   udpsrc port=5010 caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000"
+    #     ! rtpjitterbuffer ! rtpjpegdepay ! jpegdec ! ...
+    # A bad entry is skipped with a warning; the others, and the worker, keep their stream.
+    rtp_extra_clients: ""
     # Rate of image_raw/compressed. A lower positive rate drops frames on the ROS branch only, by
     # PTS, and the frames it keeps carry their own capture stamps (videorate, which did this until
     # 2026-10-16, restamped them up to a capture period early); the RTP branch stays at
