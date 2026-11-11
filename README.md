@@ -86,8 +86,33 @@ a pipeline error). Not yet run against the real camera on the robot.
   not pair it with images by stamp — its stamp is the node's start. `ros2 bag record` picks the
   durability up from the publisher; `ros2 bag play` on Humble needs a QoS override marking the
   topic transient local for late joiners to get it.
-- **ISP controls** (exposure, white balance, gain, flicker) are written once at capture start with
-  the WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
+- **ISP controls** (exposure, white balance, gain, flicker) are written at capture start with the
+  WebRTC worker's measured values; see `params/camera_feeder_params.yaml`.
+- **The exposure can be overridden while streaming** with `exposure_override_us` (microseconds;
+  0 = none, back to the configured `auto_exposure` / `exposure_time`):
+  ```bash
+  ros2 param set /<robot_id>/syncai_camera_feeder exposure_override_us 4000
+  ros2 param set /<robot_id>/syncai_camera_feeder exposure_override_us 0
+  ```
+  `syncai_landmark_detection`'s ArUco detector is its caller: auto exposure meters the whole frame
+  and stops at 8333 µs, so the dock's marker (0.4 % of the frame) burns out, and the detector,
+  which knows where the marker is, asks for the exposure that shows it. The request is clamped to
+  100–16600 µs and rounded to the driver's 100 µs; the node rewrites `v4l2src`'s `extra-controls`
+  with the capture-start string and only the exposure changed, and logs the string and how long
+  the write took. Limits to know:
+  - **Every viewer of the camera gets the darker picture** while it lasts (the console, a bag
+    recording): there is one sensor.
+  - **A failed write is not reported.** The property set returns nothing; check with
+    `v4l2-ctl -d /dev/syncai/camera0 --get-ctrl exposure_time_absolute`.
+  - **Nothing gives the override back for a caller that died**; it lasts until a set of 0 or this
+    node's restart (a respawn starts at 0).
+  - **Another writer of the camera's controls** (SyncAI-Robot-Charger's `camera_control.py`,
+    `v4l2-ctl` by hand) is not seen and wins until the next set.
+  - With `stabilize` on, the warp's IMU time offset keeps assuming the configured exposure (one
+    warning); `image_raw/compressed` is unaffected.
+  - Not yet run against the camera: that the sensor follows a mid-stream change, how many frames
+    it takes, and the frame rate over minutes of manual exposure (the charger saw it step down
+    to 30 Hz through `vizion-ctl`, cause unknown) are still to be measured on robot01.
 - **On any pipeline error the node exits** and the launch file respawns it.
 - **Another GStreamer receiver** gets the RTP stream through `rtp_extra_clients`
   (`"127.0.0.1:5010"`, comma-separated for more), never by opening the camera or by binding the
@@ -101,7 +126,7 @@ a pipeline error). Not yet run against the real camera on the robot.
   In another container it needs host networking to be reachable at `127.0.0.1`. There is no RTSP
   server here; one (MediaMTX, `gst-rtsp-server`) would be such a receiver.
 
-Parameters (all read-only) are documented in
+Parameters (all read-only but `exposure_override_us`) are documented in
 [`params/camera_feeder_params.yaml`](params/camera_feeder_params.yaml).
 
 **This repo is itself a single colcon package** (`package.xml` / `Cargo.toml` live at the root),

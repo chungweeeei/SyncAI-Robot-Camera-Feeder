@@ -11,8 +11,9 @@ mod warp;
 mod warp_bridge;
 
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -28,7 +29,7 @@ use bus::BusWatch;
 use eis::Stabilizer;
 use imu::{ImuBuffer, ImuSample, SharedImu};
 use parameters::{Parameters, StabilizeConfig};
-use pipeline::{JpegCodec, JpegCodecChoice, PipelineConfig};
+use pipeline::{JpegCodec, JpegCodecChoice, PipelineConfig, SensorControls};
 use rate_limit::RateLimiter;
 use stamp::FrameTiming;
 use warp_bridge::{SharedStamps, WarpTiming};
@@ -54,9 +55,10 @@ const IMU_HISTORY: usize = 400;
 ///
 /// # Threading
 ///
-/// No rclrs worker or timer. The one executor callback is the IMU subscription, present only
-/// with `stabilize` on; it runs on the executor thread `main.rs` spins and does nothing but push
-/// the sample into the buffer shared with the warp. Frames are published straight from an
+/// No rclrs worker or timer. Two callbacks run on the executor thread `main.rs` spins: the IMU
+/// subscription, present only with `stabilize` on, which does nothing but push the sample into
+/// the buffer shared with the warp, and a set of `exposure_override_us`, which writes the sensor
+/// controls through `v4l2src` (`follow_exposure_override`). Frames are published straight from an
 /// appsink's GStreamer streaming thread (an rclrs `Publisher` is an `Arc` and `publish` takes
 /// `&self`); the warp runs on the capture pipeline's streaming thread, fanned out across rayon's
 /// workers. Each pipeline's bus is watched on a thread of its own. The executor otherwise only
@@ -191,6 +193,14 @@ impl CameraFeederNode {
             }
             return Err(err);
         }
+
+        follow_exposure_override(
+            &parameters.exposure_override_us,
+            &pipeline,
+            config.pipeline.sensor_controls.clone(),
+            config.stabilize.is_some(),
+            node.logger(),
+        );
 
         // The worker's destination first, then any rtp_extra_clients.
         let rtp_destinations = std::iter::once(format!(
@@ -365,6 +375,90 @@ fn stop(pipeline: &gst::Pipeline, logger: &Logger) {
             pipeline.name()
         );
     }
+}
+
+/// Applies `exposure_override_us` to the streaming camera, now and at every later set.
+///
+/// The landmark detector sets it while it looks for the dock's marker: auto exposure meters the
+/// whole frame and stops at 8333 µs, and a marker that fills 0.4 % of it burns out (robot01,
+/// 2026-11-11: 51 % of the marker's pixels at 250 and above, its black border gone). Who decides
+/// the exposure is the detector, which knows where the marker is; who writes the camera stays this
+/// node, the only one that has it open.
+///
+/// The write is `v4l2src`'s `extra-controls` property, which GStreamer 1.20 applies at once while
+/// the device is open (`gst_v4l2_object_set_property_helper`), with the same string the capture
+/// starts on and only the exposure changed — so the override can never leave the white balance
+/// or the gain somewhere a second code path chose. It runs on the executor thread, in the
+/// parameter's `on_change`, while the streaming thread dequeues buffers from the same device.
+///
+/// **A failed write is not visible here**: the property set returns nothing, and a control the
+/// driver refuses is a GStreamer warning in its own debug log. The line this logs is what was
+/// asked of the camera; `v4l2-ctl --get-ctrl` is what it did.
+///
+/// A value from the params file or the command line is applied the same way, once the pipeline
+/// is PLAYING. Under a `source_override` there is no camera: a set is accepted (the detector must
+/// not have to know) and logged as having no effect.
+fn follow_exposure_override(
+    parameter: &MandatoryParameter<i64>,
+    pipeline: &gst::Pipeline,
+    base: SensorControls,
+    stabilized: bool,
+    logger: &Logger,
+) {
+    let source = pipeline.by_name(pipeline::CAMERA_SRC_NAME);
+    let logger = logger.clone();
+    let previous_us = AtomicI64::new(0);
+    let warned_stabilized = AtomicBool::new(false);
+    let apply = move |requested_us: &i64| {
+        let requested_us = *requested_us;
+        let previous_us = previous_us.swap(requested_us, Ordering::Relaxed);
+        let Some(source) = &source else {
+            log_warn!(
+                &logger,
+                "[CameraFeederNode] exposure_override_us {previous_us} -> {requested_us}: no \
+                 effect, the pipeline has no v4l2src (source_override is set)"
+            );
+            return;
+        };
+        let controls =
+            pipeline::sensor_controls(&pipeline::with_exposure_override(&base, requested_us));
+        let structure = match controls.parse::<gst::Structure>() {
+            Ok(structure) => structure,
+            Err(err) => {
+                log_error!(
+                    &logger,
+                    "[CameraFeederNode] exposure_override_us {previous_us} -> {requested_us}: \
+                     not written, \"{controls}\" is not a GstStructure: {err}"
+                );
+                return;
+            }
+        };
+        let started = Instant::now();
+        source.set_property("extra-controls", structure);
+        log_info!(
+            &logger,
+            "[CameraFeederNode] exposure_override_us {previous_us} -> {requested_us}: wrote \
+             \"{controls}\" in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        // The warp's frame_time_offset_ns holds half the exposure time and is computed once, from
+        // the configured exposure; an override moves the true middle of exposure by up to 8 ms
+        // without it. Not followed: the fleet runs stabilize off, and the detector only reads
+        // image_raw/compressed, which is never warped.
+        if stabilized && requested_us != 0 && !warned_stabilized.swap(true, Ordering::Relaxed) {
+            log_warn!(
+                &logger,
+                "[CameraFeederNode] exposure_override_us is set with stabilize on: the warp's \
+                 IMU time offset still assumes the configured exposure, so the stabilized view \
+                 is warped up to half the exposure difference early or late while it lasts"
+            );
+        }
+    };
+    let initial_us = parameter.get();
+    if initial_us != 0 {
+        apply(&initial_us);
+    }
+    parameter.on_change(apply);
 }
 
 /// The IMU subscription: every sample goes into the shared buffer, and the warp waiting for one
