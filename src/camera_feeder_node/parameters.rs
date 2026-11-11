@@ -88,16 +88,25 @@ pub struct StabilizeConfig {
     pub jpeg_codec: JpegCodecChoice,
 }
 
-/// The node's parameters, all of them load-time only.
+/// The node's parameters: load-time only, but for `exposure_override_us`.
 ///
-/// Declared `read_only()`: the pipeline is built once from them, so `ros2 param set` could not
-/// take effect anyway, and a rejected set says so where a silently ignored one would not. Values
-/// still come from the params file and the launch file's overrides, which are applied at
-/// declaration time.
+/// The load-time ones are declared `read_only()`: the pipeline is built once from them, so
+/// `ros2 param set` could not take effect anyway, and a rejected set says so where a silently
+/// ignored one would not. Values still come from the params file and the launch file's overrides,
+/// which are applied at declaration time.
+///
+/// `exposure_override_us` is the one a caller may set while the camera streams (`mod.rs` writes
+/// it through `v4l2src`'s `extra-controls`). It is a parameter of its own rather than a writable
+/// `auto_exposure` / `exposure_time` pair because those two are the camera's resting state: an
+/// override is one write that takes effect at once and is given back by writing 0, where a caller
+/// of the pair would have to read both, remember them and write them back — restoring whatever
+/// another writer had left there — and know the UVC menu's polarity and the 100 µs unit.
 ///
 /// The handles are kept for the node's lifetime because a parameter is undeclared when its handle
 /// drops.
 pub struct Parameters {
+    /// 0 = none; above 0 = manual exposure for that many µs (see `pipeline::exposure_override`).
+    pub exposure_override_us: MandatoryParameter<i64>,
     _text: Vec<ReadOnlyParameter<Arc<str>>>,
     _integer: Vec<ReadOnlyParameter<i64>>,
     _real: Vec<ReadOnlyParameter<f64>>,
@@ -192,6 +201,16 @@ impl Parameters {
             DEFAULT_EXPOSURE_TIME_100US.into(),
             "exposure in 100 us units; only applied when auto_exposure is 1",
         )?;
+        let exposure_override_us = node
+            .declare_parameter("exposure_override_us")
+            .default(0_i64)
+            .description(
+                "settable while streaming: 0 = no override (auto_exposure / exposure_time \
+                 apply), above 0 = manual exposure in us, clamped to 100..16600 and rounded to \
+                 100 us",
+            )
+            .validate(validate_exposure_override)
+            .mandatory()?;
         let white_balance_automatic =
             integer("white_balance_automatic", 0, "1 = automatic, 0 = manual")?;
         let white_balance_temperature = integer(
@@ -420,6 +439,7 @@ impl Parameters {
 
         Ok((
             Self {
+                exposure_override_us,
                 _text: vec![
                     device,
                     rtp_host,
@@ -618,6 +638,20 @@ fn positive(name: &str, value: i64, default: u32, warn: &mut impl FnMut(String))
     }
 }
 
+/// Refuses a negative `exposure_override_us`, so the caller's set fails with the reason instead
+/// of being read as "no override". Anything above 0 is accepted and clamped where it is applied:
+/// a detector that asks for 50 µs wants the shortest exposure there is, not an error.
+fn validate_exposure_override(requested_us: &i64) -> Result<(), String> {
+    if *requested_us < 0 {
+        Err(format!(
+            "exposure_override_us={requested_us} is negative; 0 removes the override, above 0 is \
+             an exposure in us"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// `auto_exposure` (UVC menu: 0 = auto, 1 = manual) plus `exposure_time`, which is read only in
 /// manual mode. Any other mode value falls back to the default mode with a warning rather than
 /// being written to the driver verbatim.
@@ -787,6 +821,15 @@ mod tests {
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("width"), "{}", warnings[0]);
         }
+    }
+
+    #[test]
+    fn a_negative_exposure_override_is_refused_with_the_reason() {
+        assert!(validate_exposure_override(&0).is_ok());
+        assert!(validate_exposure_override(&1).is_ok());
+        assert!(validate_exposure_override(&1_000_000).is_ok());
+        let reason = validate_exposure_override(&-1).unwrap_err();
+        assert!(reason.contains("exposure_override_us=-1"), "{reason}");
     }
 
     #[test]

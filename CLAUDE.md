@@ -78,8 +78,8 @@ container whose device is missing).
 | File | Responsibility |
 | --- | --- |
 | `mod.rs` | Wiring: parameters → publisher → pipeline → appsink callbacks → bus watch; `Drop` takes the pipeline to NULL |
-| `parameters.rs` | The load-time (read-only) parameters, validated into `Config`; the validators are unit-tested |
-| `pipeline.rs` | **Pure** pipeline description and `extra-controls` string; unit-tested |
+| `parameters.rs` | The load-time (read-only) parameters, validated into `Config`, and the one runtime-settable one, `exposure_override_us`; the validators are unit-tested |
+| `pipeline.rs` | **Pure** pipeline description and `extra-controls` string, at capture start and under an `exposure_override_us` (`with_exposure_override`); unit-tested |
 | `stamp.rs` | **Pure** capture-stamp math (node clock now − frame age on the pipeline clock); unit-tested |
 | `rate_limit.rs` | **Pure** choice of which frames to keep for `ros_framerate`, by PTS, restamping none; unit-tested |
 | `camera_info.rs` | **Pure** parser / validator of `camera_calibration`'s `ost.yaml` for `camera_info`; rejects rather than publishes a wrong calibration (another resolution, short matrices, unknown model); unit-tested |
@@ -128,10 +128,13 @@ is now a sink-pad probe on an `identity name=rate_limit` that drops by PTS (`rat
 the stamps give it away: restamped ones sit on an exact grid (period jitter ~0.02 ms at 30 fps),
 which real capture stamps never do (~0.3 ms).
 
-**Threading:** no rclrs worker or timer. The one executor callback is the IMU subscription
-(`node.create_subscription`, only with `stabilize` on); it runs on the executor thread `main.rs`
-spins and does nothing but push the sample into the `Arc<(Mutex<ImuBuffer>, Condvar)>` shared
-with the warp. Frames are published from an appsink's GStreamer streaming thread (an rclrs
+**Threading:** no rclrs worker or timer. Two callbacks run on the executor thread `main.rs`
+spins: the IMU subscription (`node.create_subscription`, only with `stabilize` on), which does
+nothing but push the sample into the `Arc<(Mutex<ImuBuffer>, Condvar)>` shared with the warp, and
+`exposure_override_us`'s `on_change` (`follow_exposure_override` in `mod.rs`), which sets
+`v4l2src`'s `extra-controls` — GStreamer 1.20 writes the controls at once while the device is
+open — while the streaming thread dequeues from the same fd. Its closure holds the `v4l2src`
+element, not the pipeline, and lives in the node's parameter map, so it closes no cycle. Frames are published from an appsink's GStreamer streaming thread (an rclrs
 `Publisher` is an `Arc`, `publish(&self)`); the warp runs on the capture pipeline's streaming
 thread, fanned out across rayon's workers, and pushes into the output pipeline's `appsrc`. Each
 pipeline's bus is polled on its own thread, and the executor otherwise only spins so the node is

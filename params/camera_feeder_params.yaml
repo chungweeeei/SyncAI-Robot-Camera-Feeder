@@ -1,5 +1,6 @@
-# Parameters for the syncai_camera_feeder node. All are read once at startup (read-only): the
-# pipeline is built from them, so `ros2 param set` is rejected rather than silently ignored.
+# Parameters for the syncai_camera_feeder node. All but exposure_override_us are read once at
+# startup (read-only): the pipeline is built from them, so `ros2 param set` is rejected rather
+# than silently ignored.
 #
 # The key is a bare /** because rclrs only matches a params-file key that is exactly "/**" or
 # exactly the node's fully-qualified name, with NO wildcard expansion (see SyncAI-Robot-State's
@@ -62,6 +63,17 @@
     auto_exposure: 0
     # 100 us units; only written when auto_exposure is 1.
     exposure_time: 330
+    # The one parameter that can be set while the camera streams, in MICROSECONDS: 0 = no override
+    # (the two above apply), above 0 = manual exposure for that long, clamped to 100..16600 (one
+    # V4L2 step .. one 60 fps frame period) and rounded to 100 us. A negative set is refused.
+    # syncai_landmark_detection's ArUco detector sets it while it looks for the dock's marker,
+    # which auto exposure burns out (it meters the whole frame and stops at 8333 us), and writes 0
+    # when it goes idle; the console's picture is darker meanwhile. Leave it 0 here: a value in
+    # this file is a camera that is manual from boot, and the detector's 0 then gives back the two
+    # parameters above, not this value. A detector that died mid-charge leaves its last exposure
+    # until this node restarts or someone runs
+    #   ros2 param set /<robot_id>/syncai_camera_feeder exposure_override_us 0
+    exposure_override_us: 0
     # Manual white balance at 5200 K: auto settles distinctly blue under the lab's fluorescent
     # lighting, and retunes as the frame fills with a coloured wall.
     white_balance_automatic: 0

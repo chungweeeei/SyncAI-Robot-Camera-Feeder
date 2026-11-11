@@ -18,6 +18,9 @@ pub const WARPED_SRC_NAME: &str = "warped";
 /// its sink pad that drops frames by PTS (`rate_limit.rs`). Present only when
 /// [`is_rate_limited`].
 pub const RATE_LIMIT_NAME: &str = "rate_limit";
+/// The `v4l2src` itself. The node looks it up to rewrite its `extra-controls` while the camera is
+/// streaming (`exposure_override_us`); absent under a `source_override`.
+pub const CAMERA_SRC_NAME: &str = "camera_src";
 
 /// The two descriptions of the stabilized path. `capture` ends in the raw appsink and `output`
 /// starts at the appsrc the warp feeds; the Rust warp (`warp_bridge.rs`) is the bridge between
@@ -40,6 +43,45 @@ pub const DEFAULT_WHITE_BALANCE_KELVIN: u32 = 5200;
 pub enum Exposure {
     Auto,
     Manual { time_100us: u32 },
+}
+
+/// Shortest exposure an `exposure_override_us` is clamped to. Direct sun on the dock's marker read
+/// 10/10 at 4000 µs and below (SyncAI-Robot-Charger, doc/experiments.md); 100 µs is the one
+/// V4L2 step (`exposure_time_absolute` counts 100 µs) and the charger's own floor.
+pub const EXPOSURE_OVERRIDE_MIN_US: i64 = 100;
+/// Longest exposure an `exposure_override_us` is clamped to: one frame period at the sensor's
+/// 60 fps. A longer one is not a darker-scene setting but a slower camera (20 000 µs and above
+/// measured below 60 Hz on this sensor), and the RTP branch carries every frame.
+pub const EXPOSURE_OVERRIDE_MAX_US: i64 = 16_600;
+
+/// The exposure an `exposure_override_us` value asks for: `None` at 0 (no override, the
+/// configured exposure stands), else manual at the request clamped to
+/// [`EXPOSURE_OVERRIDE_MIN_US`] ..= [`EXPOSURE_OVERRIDE_MAX_US`] and rounded to the driver's
+/// 100 µs step.
+///
+/// Microseconds in, so a caller (the landmark detector) needs neither the 100 µs unit nor the
+/// UVC menu's polarity; both stay in this file. A negative request never gets here: the
+/// parameter's validator refuses it.
+#[must_use]
+pub fn exposure_override(requested_us: i64) -> Option<Exposure> {
+    if requested_us <= 0 {
+        return None;
+    }
+    let us = requested_us.clamp(EXPOSURE_OVERRIDE_MIN_US, EXPOSURE_OVERRIDE_MAX_US);
+    // The clamp bounds it to 1..=166, so the conversion cannot fail.
+    let time_100us = u32::try_from((us + 50) / 100).unwrap_or(1);
+    Some(Exposure::Manual { time_100us })
+}
+
+/// `base` with its exposure replaced by what `exposure_override_us` asks for, or `base` itself at
+/// 0. Everything else (white balance, gain, flicker) is the configured value either way, so the
+/// string written while streaming is the capture-start string with one field changed.
+#[must_use]
+pub fn with_exposure_override(base: &SensorControls, requested_us: i64) -> SensorControls {
+    SensorControls {
+        exposure: exposure_override(requested_us).unwrap_or(base.exposure),
+        ..base.clone()
+    }
 }
 
 /// White-balance mode; the temperature exists only in manual mode, as with [`Exposure`].
@@ -393,7 +435,7 @@ fn encoder(codec: JpegCodec) -> &'static str {
 fn capture_head(config: &PipelineConfig) -> String {
     if config.source_override.trim().is_empty() {
         format!(
-            "v4l2src device=\"{}\" io-mode=2 extra-controls=\"{}\" \
+            "v4l2src device=\"{}\" io-mode=2 name={CAMERA_SRC_NAME} extra-controls=\"{}\" \
              ! image/jpeg,width={},height={},framerate={}/1",
             config.device,
             sensor_controls(&config.sensor_controls),
@@ -527,6 +569,63 @@ mod tests {
     fn auto_exposure_omits_the_exposure_time() {
         let out = sensor_controls(&SensorControls::default());
         assert!(!out.contains("exposure_time_absolute"), "{out}");
+    }
+
+    #[test]
+    fn no_override_leaves_the_configured_exposure() {
+        assert_eq!(exposure_override(0), None);
+        let manual = SensorControls {
+            exposure: Exposure::Manual { time_100us: 330 },
+            ..SensorControls::default()
+        };
+        assert_eq!(with_exposure_override(&manual, 0), manual);
+        assert_eq!(
+            with_exposure_override(&SensorControls::default(), 0),
+            SensorControls::default()
+        );
+    }
+
+    #[test]
+    fn an_override_is_manual_exposure_in_the_drivers_100_us_steps() {
+        for (requested_us, time_100us) in [(8333, 83), (4166, 42), (2083, 21), (1000, 10)] {
+            assert_eq!(
+                exposure_override(requested_us),
+                Some(Exposure::Manual { time_100us }),
+                "{requested_us}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_is_clamped_to_one_step_and_one_frame_period() {
+        assert_eq!(
+            exposure_override(1),
+            Some(Exposure::Manual { time_100us: 1 })
+        );
+        assert_eq!(
+            exposure_override(1_000_000),
+            Some(Exposure::Manual { time_100us: 166 })
+        );
+        assert_eq!(
+            exposure_override(i64::MAX),
+            Some(Exposure::Manual { time_100us: 166 })
+        );
+    }
+
+    #[test]
+    fn an_override_changes_the_exposure_and_nothing_else() {
+        let out = sensor_controls(&with_exposure_override(&SensorControls::default(), 8333));
+        assert_eq!(
+            out,
+            "c,auto_exposure=1,exposure_time_absolute=83,white_balance_automatic=0,\
+             white_balance_temperature=5200,gain=1,brightness=16,power_line_frequency=1"
+        );
+    }
+
+    #[test]
+    fn the_camera_source_is_named_for_the_runtime_controls() {
+        let out = build_pipeline_string(&config());
+        assert!(out.contains(&format!("name={CAMERA_SRC_NAME} ")), "{out}");
     }
 
     #[test]
